@@ -1,0 +1,8 @@
+state.json
+state.json.tmp
+logs/
+ledger.jsonl
+__pycache__/
+*/__pycache__/
+.DS_Store
+.env
