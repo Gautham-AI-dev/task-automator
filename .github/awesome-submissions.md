@@ -33,6 +33,19 @@ Entry for skill-collection READMEs (e.g. open-hax/opencode-skills style):
 * [task-automator](https://github.com/Gautham-AI-dev/task-automator) – Execution harness skill for headless `opencode run` batches: crash-safe `state.json` resume, artifact done-verification (`newfile`/`minlines`/`mtime`), telemetry time gates, JSONL cost ledger, stall watchdog, `--budget`/`--max-retries` guards. Ships `SKILL.md` agent contract + offline tests.
 ```
 
+### Decision 2026-10-06: NO PR to open-hax/opencode-skills (recorded, not deferred)
+
+- That repo accepts skill *directories* (`.opencode/skills/<name>/SKILL.md`),
+  not link entries, and its only category is DevSecOps infrastructure
+  discovery. A batch-execution harness does not fit its taxonomy.
+- Forcing a misfit PR risks a rejection that harms the repo's standing
+  with curators. Opencode discoverability is covered by: the
+  `opencode-skills` topic on this repo, the `SKILL.md` agent contract
+  shipped in-repo, and the two awesome-list PRs above.
+- Revisit if: they add an execution/automation category, or a general
+  opencode-skills registry emerges (e.g. awesomeskills.dev listing —
+  submit there instead; it indexes skill repos by URL).
+
 ## Submission checklist (per list)
 
 - [ ] Read the list's CONTRIBUTING.md (format, alphabetical order, section fit).
