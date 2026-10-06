@@ -23,8 +23,13 @@ def define_app(DBOS, mod):
         verdicts = {s: store.acquire(s, estimate) for s in scopes}
         return verdicts
 
-    @DBOS.step(timeout_seconds=1800, retries_allowed=False)
+    @DBOS.step(retries_allowed=False)
     async def step_dispatch(task, prompt, model, timeout, logdir):
+        # Timeout precedence: the asyncio.wait_for below owns the timeout
+        # (rc 124 path). Set the decorator's timeout_seconds HIGHER than any
+        # configured task timeout so the decorator never wins with a
+        # different error shape; DBOS step timeouts are async-only, which is
+        # why this step is a coroutine (sync steps cannot time out).
         os.makedirs(logdir, exist_ok=True)
         log = os.path.join(logdir, task['id'] + '.log')
         cmd = ['opencode', 'run', '--agent', task['agent'], '-m', model,
@@ -76,7 +81,9 @@ def define_app(DBOS, mod):
 
     @DBOS.step(retries_allowed=True, max_attempts=3)
     def step_notify_runbook(task_id, reason):
-        # delivery to pager/runbook goes here; retryable by design
+        # delivery to pager/runbook goes here; retryable by design.
+        # STUB (unexecuted): wire to the real runbook channel before
+        # relying on denial/non-done alerts in production.
         return {'task': task_id, 'notified': True, 'reason': reason}
 
     @DBOS.workflow()
@@ -116,15 +123,17 @@ def define_app(DBOS, mod):
                      'exit': rc, 'checks': checks, 'label': label}
             step_notify_runbook(task['id'], 'non-done: %s' % (final,))
         if opts.get('needs_approval') and final.get('status') == 'done':
+            # Approval arrives at THIS workflow's inbox (approve --wid
+            # <this-workflow-id>); 'approver' only gets a notification copy.
+            # Single timeout via DBOS.recv (no asyncio.wait_for wrapper:
+            # two competing timers produced two different error shapes).
             DBOS.send('approver', {'task': task['id'], 'result': final})
             try:
-                msg = await asyncio.wait_for(
-                    DBOS.recv(timeout=float(opts.get('approval_timeout',
-                                                     7 * 86400))),
-                    timeout=float(opts.get('approval_timeout', 7 * 86400)))
+                msg = DBOS.recv(timeout=float(opts.get('approval_timeout',
+                                                       7 * 86400)))
                 approved = mod.parse_approval(msg)
-            except asyncio.TimeoutError:
-                approved = False
+            except Exception:
+                approved = False  # timeout or transport error: fail closed
             final['approved'] = approved
             if not approved:
                 final['status'] = 'awaiting-approval-failed-closed'

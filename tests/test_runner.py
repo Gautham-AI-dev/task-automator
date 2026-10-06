@@ -104,6 +104,23 @@ def test_cost_incomplete():
     print('PASS cost-incomplete')
 
 
+def test_cost_partial_finish():
+    # #26855 exact mode: intermediate step_finish present, final missing
+    # (last event is text). Sum exists but must NOT count as complete.
+    import tempfile
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, 'z.log')
+    with open(p, 'w') as f:
+        f.write('{"type":"step_start","part":{}}\n')
+        f.write('{"type":"step_finish","part":{"tokens":{"input":50,'
+                '"output":5},"cost":0.01}}\n')
+        f.write('{"type":"text","part":{"text":"tail with no finish"}}\n')
+    c = runner.parse_cost(p)
+    assert c['complete'] is False and 'partial-step-finish' in c['reason'], c
+    assert c['tokens_in'] == 50 and c['cost'] == 0.01, c
+    print('PASS cost-partial')
+
+
 def test_failure_class():
     assert runner.failure_class(124, True, [True]) == (True, 'timeout/stall')
     assert runner.failure_class(1, False, [True]) == (
@@ -123,6 +140,93 @@ def test_ledger_total():
     print('PASS ledger-total')
 
 
+def _mini_manifest(outdir):
+    return {'default_model': 'm', 'stall_after_sec': 600, 'tasks': [
+        {'id': 'T01', 'title': 't1', 'agent': 'a', 'section': 'T01',
+         'done': [{'type': 'newfile', 'dir': outdir,
+                   'glob': 'health-*.md'}]}]}
+
+
+def test_legacy_done_reruns():
+    # pre-upgrade done entry without run_start: fail-safe re-run path
+    # (dispatches once via stubbed dispatch), then carries run_start.
+    import tempfile
+    import unittest.mock as mock
+    d = tempfile.mkdtemp()
+    out = os.path.join(d, 'out')
+    os.makedirs(out)
+    spath = os.path.join(d, 'state.json')
+    runner.save_state(spath, {'tasks': {'T01': {'status': 'done',
+                                                'finished_at': 'old'}}})
+    man, prompts = _mini_manifest(out), {'T01': 'do t1'}
+    logdir = os.path.join(d, 'logs')
+    os.makedirs(logdir)
+    open(os.path.join(logdir, 'T01.log'), 'w').write(
+        '{"type":"step_finish","part":{"tokens":{"input":1,"output":1},'
+        '"cost":0}}\n')
+    f = os.path.join(out, 'health-x.md')
+    open(f, 'w').write('x')
+    import time
+    os.utime(f, (time.time() + 5, time.time() + 5))
+    with mock.patch.object(runner, 'HERE', d):
+        st = runner.load_state(spath)
+        runner.run_tasks(man, prompts, st, spath, ['T01'], 'm', 60,
+                         False, None, 0)
+        st2 = runner.load_state(spath)
+        assert st2['tasks']['T01'].get('run_start'), st2
+    print('PASS legacy-done')
+
+
+def test_retry_loop():
+    # transient failure (rc=1, checks pass) with max_retries=1: dispatch
+    # called twice (initial + 1 retry), final state records attempt 2.
+    import tempfile
+    import unittest.mock as mock
+    d = tempfile.mkdtemp()
+    out = os.path.join(d, 'out')
+    os.makedirs(out)
+    spath = os.path.join(d, 'state.json')
+    man, prompts = _mini_manifest(out), {'T01': 'do t1'}
+    calls = []
+    logdir = os.path.join(d, 'logs')
+    os.makedirs(logdir)
+
+    def fake_dispatch(task, prompt, model, timeout, ld, stall_after):
+        calls.append(1)
+        with open(os.path.join(logdir, task['id'] + '.log'), 'w') as lf:
+            lf.write('{"type":"step_finish","part":{"tokens":{"input":1,'
+                     '"output":1},"cost":0}}\n')
+        # each attempt produces a fresh artifact (newfile checks mtime >=
+        # that attempt's run_start, so the fixture must refresh it too)
+        import time as _t
+        now = _t.time() + 5
+        os.utime(f, (now, now))
+        return 1, False  # nonzero exit, but artifact check below passes
+
+    f = os.path.join(out, 'health-x.md')
+    open(f, 'w').write('x')
+    import time
+    with mock.patch.object(runner, 'HERE', d), \
+         mock.patch.object(runner, 'dispatch', fake_dispatch):
+        st = {'tasks': {}}
+        runner.run_tasks(man, prompts, st, spath, ['T01'], 'm', 60,
+                         False, None, 1)
+        assert len(calls) == 2, calls
+        st2 = runner.load_state(spath)
+        rec = st2['tasks']['T01']
+        assert rec['attempt'] == 2 and rec['retryable'] is True, rec
+    # max_retries=0: single attempt, no retry
+    calls.clear()
+    spath2 = os.path.join(d, 's2.json')
+    with mock.patch.object(runner, 'HERE', d), \
+         mock.patch.object(runner, 'dispatch', fake_dispatch):
+        st = {'tasks': {}}
+        runner.run_tasks(man, prompts, st, spath2, ['T01'], 'm', 60,
+                         False, None, 0)
+        assert len(calls) == 1, calls
+    print('PASS retry-loop')
+
+
 if __name__ == '__main__':
     test_markers()
     test_state_crashsafe()
@@ -130,6 +234,9 @@ if __name__ == '__main__':
     test_gate()
     test_cost_parse()
     test_cost_incomplete()
+    test_cost_partial_finish()
     test_failure_class()
     test_ledger_total()
+    test_legacy_done_reruns()
+    test_retry_loop()
     print('ALL PASS')

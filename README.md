@@ -15,7 +15,6 @@ stall watchdog. MIT licensed (see LICENSE).
 - `tests/test_runner.py` — offline tests (`python tests/test_runner.py`).
 - `tests/test_runner_dbos.py` — offline tests for the DBOS module
   (`python tests/test_runner_dbos.py`; needs no DBOS/Postgres).
-- `tests/test_runner.py` — offline tests (`python tests/test_runner.py`).
 - `tasks.example.json` — 3-task example manifest (edit paths, rename to
   `tasks.json`).
 - `PROMPTS.example.md` — matching example prompts (rename to `PROMPTS.md`).

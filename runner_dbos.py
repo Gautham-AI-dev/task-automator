@@ -5,6 +5,11 @@ Postgres. Without them this module still imports fine (pure helpers and
 tests run); only launch()/status()/approve() raise a clear error.
 runner.py remains the zero-dependency default.
 
+STATUS: define_app()/task_workflow has NEVER executed (dbos uninstallable
+in this env; no Postgres here). Treat the workflow file as reviewed but
+unproven until the first Postgres run; the BudgetStore/approval helpers
+are covered by tests/test_runner_dbos.py.
+
 Design (one workflow per task: short histories, no long sleeps):
   launch -> DBOS.start_workflow(task_workflow, task, prompt, opts)
   workflow: acquire budget (step) -> dispatch agent (async step bounded
@@ -33,11 +38,9 @@ is written against dbos-transact-py v2.x docs; re-verify kwarg names
 against the installed version on the first Postgres run.
 """
 import argparse
-import asyncio
 import json
 import os
 import sqlite3
-import subprocess
 import sys
 import time
 

@@ -61,8 +61,10 @@ python runner.py reset [--only ...]
   is `failed` (retryable) or `stalled` (killed by watchdog, retryable).
 - `waiting` tasks re-check gates every invocation; nothing executes early.
 - Retry policy: timeouts/stalls and nonzero-exits whose artifact checks
-  still pass are `retryable` (`--max-retries N` to auto-flag them);
-  nonzero-exits with failing checks need human review, never auto-retry.
+  still pass are `retryable`; `--max-retries N` re-dispatches them
+  in-process up to N times (attempt counter survives in state.json), stalled
+  tasks included. Nonzero-exits with failing checks need human review,
+  never auto-retry.
 - `--budget USD` halts before the next dispatch once the ledger total
   reaches the cap.
 
@@ -73,8 +75,10 @@ cost. Feeds cost-guard budgeting. Stuck detection: the watchdog kills runs
 whose log stops growing for `stall_after_sec` and marks them `stalled`.
 
 Known upstream gap (opencode #26855): `run --format json` can exit on
-idle before emitting the final step_finish event. Ledger entries parsed
-from such logs carry `complete: false` plus a reconcile warning — do not
+idle before emitting the final step_finish event. Only a log whose LAST
+event is step_finish counts as `complete: true`; earlier-but-not-final
+step_finish sums are flagged `partial-step-finish` and treated as lower
+bounds (the `--budget` cap enforces against them conservatively) — do not
 treat their totals as authoritative; reconcile via the session DB/export.
 
 ## Resume contract (the core guarantee)
@@ -103,7 +107,13 @@ python runner_dbos.py approve --wid taskauto-T01-<stamp> --approve yes|no
 
 Rules baked in (report-code bugs fixed): every budget/ledger/side effect
 is a `@step` (workflow body orchestrates only); dispatch is an async
-step so `timeout_seconds` applies; ledger append is non-retried; budget
-caps live in Postgres with `SELECT ... FOR UPDATE` (SQLite only with
-`TASK_AUTO_SINGLE_WORKER=1`, otherwise refused); approval waits are
-durable `recv` with timeout, fail-closed on timeout/unclear messages.
+step so timeouts apply (DBOS step timeouts are async-only); ledger append
+is non-retried; budget caps live in Postgres with `SELECT ... FOR UPDATE`
+(SQLite only with `TASK_AUTO_SINGLE_WORKER=1`, otherwise refused);
+approval waits use a single `DBOS.recv` timeout on the workflow's own
+inbox (`approve --wid` targets it; `approver` gets a notification copy
+only), fail-closed on timeout/unclear messages.
+
+Provenance: the workflow file is reviewed but UNEXECUTED (dbos +
+Postgres unavailable where built) — run it against Postgres before
+relying on durable execution; helpers are test-covered.

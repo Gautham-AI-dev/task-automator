@@ -2,6 +2,8 @@ state.json
 state.json.tmp
 logs/
 ledger.jsonl
+taskauto_budget.db
+taskauto_budget.db-journal
 __pycache__/
 */__pycache__/
 .DS_Store

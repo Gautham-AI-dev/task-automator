@@ -4,6 +4,7 @@ any break (intended or crash). Usage:
   python runner.py status [--state FILE]
   python runner.py dry-run [--only T01,..]
   python runner.py run [--only ...] [--model ...] [--state FILE]
+      [--budget USD] [--max-retries N]
   python runner.py resume [--model ...] [--state FILE]
   python runner.py reset [--only ...] [--state FILE]
 Done-check types: newfile (glob newer than run start), minlines,
@@ -12,20 +13,20 @@ span/entries. State writes are crash-safe (tmp + os.replace).
 Cost ledger: ledger.jsonl accumulates per-task tokens/cost parsed
 from --format json step_finish events. Step_finish can be missing
 (upstream opencode #26855: CLI may exit on idle before emitting it);
-such entries are flagged complete=false with a reconcile warning, never
-counted as authoritative. Stall watchdog kills runs
-whose log stops growing (stall_after_sec) and marks them stalled.
-Retry policy: timeouts/stalls and nonzero-exits with passing checks are
-retryable (see --max-retries); other failures need human review.
+only a log whose LAST event is step_finish counts as complete, others
+are flagged with a reconcile warning and their sums treated as lower
+bounds (budget cap enforces against them conservatively). Stall
+watchdog kills runs whose log stops growing (stall_after_sec) and marks
+them stalled. Retry policy: timeouts/stalls and nonzero-exits with
+passing checks are retryable (--max-retries N re-dispatches
+in-process; stalled tasks included); other failures need human review.
 Global --budget cap halts before the next dispatch once the ledger
 total reaches it."""
 import argparse
-import fnmatch
 import glob
 import json
 import os
 import subprocess
-import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -117,7 +118,7 @@ def parse_cost(log):
     complete=False rather than silently under-counting."""
     tin = tout = 0
     cost = 0.0
-    saw_step_finish = False
+    n_step_finish = 0
     last_event = None
     try:
         with open(log, encoding='utf-8', errors='ignore') as f:
@@ -135,7 +136,7 @@ def parse_cost(log):
                     last_event = etype
                 part = d.get('part', {})
                 if etype == 'step_finish' and isinstance(part, dict):
-                    saw_step_finish = True
+                    n_step_finish += 1
                     tk = part.get('tokens', {}) or {}
                     tin += int(tk.get('input', 0) or 0)
                     tout += int(tk.get('output', 0) or 0)
@@ -146,8 +147,18 @@ def parse_cost(log):
     except FileNotFoundError:
         return {'tokens_in': 0, 'tokens_out': 0, 'cost': 0.0,
                 'complete': False, 'reason': 'log-missing'}
-    complete = saw_step_finish
-    reason = 'ok' if complete else 'no-step-finish(last=%s)' % last_event
+    # #26855 mode: final step_finish missing while earlier ones exist.
+    # Only a log whose LAST event is step_finish counts as complete;
+    # anything else (incl. partial sums) is flagged for reconciliation.
+    complete = n_step_finish > 0 and last_event == 'step_finish'
+    if complete:
+        reason = 'ok'
+    elif n_step_finish > 0:
+        reason = ('partial-step-finish(%d seen, last=%s): final event '
+                  'missing, sum is a lower bound' % (n_step_finish,
+                                                     last_event))
+    else:
+        reason = 'no-step-finish(last=%s)' % last_event
     return {'tokens_in': tin, 'tokens_out': tout, 'cost': round(cost, 6),
             'complete': complete, 'reason': reason}
 
@@ -247,14 +258,20 @@ def run_tasks(manifest, prompts, state, spath, only, model, timeout, dry,
             continue
         st = state['tasks'].get(t['id'], {})
         if st.get('status') == 'done':
-            prev_start = st.get('run_start', 0)
-            recheck = [check_done(c, prev_start) for c in t['done']]
-            if prev_start and all(recheck):
-                print('%s: skip (done %s, artifacts re-verified)' % (
-                    t['id'], st.get('finished_at', '?')))
-                continue
-            print('%s: RE-RUN (was done %s but artifacts missing: %s)' % (
-                t['id'], st.get('finished_at', '?'), recheck))
+            prev_start = st.get('run_start')
+            if prev_start is None:
+                # pre-upgrade state entry: fail-safe re-run once, then the
+                # fresh entry carries run_start and skips normally.
+                print('%s: RE-RUN (legacy done entry without run_start; '
+                      'fail-safe, artifacts checked post-run)' % t['id'])
+            else:
+                recheck = [check_done(c, prev_start) for c in t['done']]
+                if all(recheck):
+                    print('%s: skip (done %s, artifacts re-verified)' % (
+                        t['id'], st.get('finished_at', '?')))
+                    continue
+                print('%s: RE-RUN (was done %s but artifacts missing: %s)' % (
+                    t['id'], st.get('finished_at', '?'), recheck))
         if budget is not None and spent >= budget:
             print('BUDGET HALT: spent %.4f >= cap %.4f; stopping' % (
                 spent, budget))
@@ -278,48 +295,52 @@ def run_tasks(manifest, prompts, state, spath, only, model, timeout, dry,
                 t['id'], t['agent'], len(prompt)))
             continue
         print('%s: dispatching to %s ...' % (t['id'], t['agent']), flush=True)
-        run_start = time.time()
-        state['tasks'][t['id']] = {'status': 'running',
-                                   'started_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
-                                   'run_start': run_start,
-                                   'attempt': st.get('attempt', 0) + 1}
-        save_state(spath, state)
-        rc, stalled = dispatch(t, prompt, model, timeout,
-                               os.path.join(HERE, 'logs'),
-                               manifest.get('stall_after_sec', 600))
-        cost = parse_cost(os.path.join(HERE, 'logs', t['id'] + '.log'))
-        ledger_append(os.path.join(HERE, 'ledger.jsonl'), t['id'], cost)
-        spent += cost.get('cost', 0.0)
-        if not cost.get('complete', True):
-            print('%s: WARNING ledger incomplete (%s); reconcile via '
-                  'session DB/export, do not trust totals' % (
-                      t['id'], cost.get('reason')))
-        checks = [check_done(c, run_start) for c in t['done']]
-        if rc == 0 and all(checks):
-            state['tasks'][t['id']] = {'status': 'done',
-                                       'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
-                                       'run_start': run_start}
-            print('%s: DONE (exit 0, checks %s)' % (t['id'], checks))
-        elif stalled:
-            state['tasks'][t['id']] = {'status': 'stalled', 'exit': rc,
-                                       'checks': checks,
-                                       'run_start': run_start,
-                                       'reason': 'killed after stall/timeout'}
-            print('%s: STALLED (exit %s checks %s)' % (t['id'], rc, checks))
-        else:
-            retryable, label = failure_class(rc, stalled, checks)
-            attempts = state['tasks'].get(t['id'], {}).get('attempt', 1)
-            will_retry = retryable and attempts <= max_retries
-            state['tasks'][t['id']] = {'status': 'failed', 'exit': rc,
-                                       'checks': checks,
-                                       'run_start': run_start,
-                                       'retryable': retryable,
-                                       'reason': 'exit %s checks %s [%s]%s' % (
-                                           rc, checks, label,
-                                           ' retrying' if will_retry else '')}
-            print('%s: FAILED (exit %s checks %s [%s]%s)' % (
-                t['id'], rc, checks, label,
-                ' retrying' if will_retry else ''))
+        attempt = st.get('attempt', 0)
+        outcome = None
+        while True:
+            attempt += 1
+            run_start = time.time()
+            state['tasks'][t['id']] = {
+                'status': 'running',
+                'started_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                'run_start': run_start, 'attempt': attempt}
+            save_state(spath, state)
+            rc, stalled = dispatch(t, prompt, model, timeout,
+                                   os.path.join(HERE, 'logs'),
+                                   manifest.get('stall_after_sec', 600))
+            cost = parse_cost(os.path.join(HERE, 'logs', t['id'] + '.log'))
+            ledger_append(os.path.join(HERE, 'ledger.jsonl'), t['id'], cost)
+            spent += cost.get('cost', 0.0)
+            if not cost.get('complete', True):
+                print('%s: WARNING ledger incomplete (%s); totals are a '
+                      'lower bound, reconcile via session DB/export' % (
+                          t['id'], cost.get('reason')))
+            checks = [check_done(c, run_start) for c in t['done']]
+            if rc == 0 and all(checks):
+                outcome = ('done', {
+                    'status': 'done',
+                    'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                    'run_start': run_start, 'attempt': attempt})
+                print('%s: DONE (exit 0, checks %s, attempt %d)' % (
+                    t['id'], checks, attempt))
+                break
+            retryable, label = failure_class(
+                rc, stalled or rc in (124, 125), checks)
+            if retryable and attempt <= max_retries:
+                print('%s: RETRY %d/%d (exit %s checks %s [%s])' % (
+                    t['id'], attempt, max_retries, rc, checks, label))
+                continue
+            outcome = ('stalled' if stalled else 'failed', {
+                'status': 'stalled' if stalled else 'failed', 'exit': rc,
+                'checks': checks, 'run_start': run_start, 'attempt': attempt,
+                'retryable': retryable,
+                'reason': ('killed after stall/timeout' if stalled else
+                           'exit %s checks %s [%s]' % (rc, checks, label))})
+            print('%s: %s (exit %s checks %s%s, attempt %d)' % (
+                t['id'], outcome[0].upper(), rc, checks,
+                '' if stalled else ' [%s]' % label, attempt))
+            break
+        state['tasks'][t['id']] = outcome[1]
         save_state(spath, state)
     print('run complete; resume anytime with: python runner.py resume')
 
@@ -335,8 +356,9 @@ def main():
                     help='global cost cap USD; halt before next dispatch once '
                          'ledger total reaches it')
     ap.add_argument('--max-retries', type=int, default=0,
-                    help='auto-retry transient failures (stall/timeout, '
-                         'nonzero-exit with passing checks) this many times')
+    help='auto-retry transient failures (stall/timeout, '
+         'nonzero-exit with passing checks) up to N re-dispatches '
+         'in-process; 0 (default) records retryable and stops')
     a = ap.parse_args()
     manifest = load_tasks()
     prompts = load_prompts()
