@@ -48,6 +48,22 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import runner  # noqa: E402  (pure logic reuse: no policy duplication)
 
+DEFAULT_SQLITE_FILE = os.path.join(HERE, 'taskauto_budget.db')
+
+
+def _resolve_sqlite_path(path):
+    """Resolve SQLite budget DB paths against HERE (not CWD), so launches
+    from different directories share one ledger. Empty path or
+    ':memory:' resolves to the HERE-relative default file with a note;
+    per-connection :memory: would silently forget caps between steps."""
+    if not path or path == ':memory:':
+        print('note: SQLite budget DB resolving to default file %s '
+              '(explicit path recommended)' % DEFAULT_SQLITE_FILE)
+        return DEFAULT_SQLITE_FILE
+    if not os.path.isabs(path):
+        return os.path.join(HERE, path)
+    return path
+
 try:
     from dbos import DBOS
     _DBOS_AVAILABLE = True
@@ -71,7 +87,11 @@ def workflow_id_for(task_id, when=None):
 
 class BudgetStore:
     """Run/task/agent spend caps. Postgres for multi-worker, SQLite only
-    for provably single-worker runs (refuses otherwise)."""
+    for provably single-worker runs (refuses otherwise).
+
+    Uncapped scopes are TRACKED (cap_usd NULL), never invisible: acquire
+    creates the row on first touch and settle upserts, so a cap added
+    later enforces against real historical spend, not zero."""
 
     SCHEMA = ('CREATE TABLE IF NOT EXISTS taskauto_budget('
               'scope TEXT PRIMARY KEY, cap_usd REAL, spent_usd REAL)')
@@ -90,8 +110,9 @@ class BudgetStore:
             self._pg = psycopg
             self.conn = psycopg.connect(url, autocommit=False)
         else:
-            self.conn = sqlite3.connect(url.replace('sqlite:///', '')
-                                        or ':memory:')
+            self.path = _resolve_sqlite_path(
+                url.replace('sqlite:///', ''))
+            self.conn = sqlite3.connect(self.path)
         self._init()
 
     def _init(self):
@@ -115,7 +136,9 @@ class BudgetStore:
         self.conn.commit()
 
     def acquire(self, scope, estimate):
-        """Reserve estimate; True if under cap. Must run inside a step."""
+        """Reserve estimate; True if under cap (or uncapped). Must run
+        inside a step. First touch creates the scope row (cap NULL =
+        tracked but uncapped)."""
         cur = self.conn.cursor()
         if self.is_pg:
             cur.execute('SELECT cap_usd, spent_usd FROM taskauto_budget '
@@ -126,10 +149,14 @@ class BudgetStore:
                         'WHERE scope=?', (scope,))
         row = cur.fetchone()
         if row is None:
-            self.conn.rollback()
-            return True  # no cap configured for this scope
+            ph = '%s' if self.is_pg else '?'
+            cur.execute('INSERT INTO taskauto_budget(scope, cap_usd, '
+                        'spent_usd) VALUES (%s, NULL, %s)' % (ph, ph),
+                        (scope, estimate))
+            self.conn.commit()
+            return True
         cap, spent = row
-        if spent + estimate > cap:
+        if cap is not None and spent + estimate > cap:
             self.conn.rollback()
             return False
         ph = '%s' if self.is_pg else '?'
@@ -139,14 +166,19 @@ class BudgetStore:
         return True
 
     def settle(self, scope, estimate, actual):
-        """Replace estimate with actual. Must run inside a step."""
+        """Replace estimate with actual. Upserts: never a silent no-op on
+        unknown scopes. Must run inside a step."""
         cur = self.conn.cursor()
         if self.is_pg:
-            cur.execute('UPDATE taskauto_budget SET '
-                        'spent_usd=spent_usd-%s+%s WHERE scope=%s',
-                        (estimate, actual, scope))
+            cur.execute('INSERT INTO taskauto_budget(scope, cap_usd, '
+                        'spent_usd) VALUES (%s, NULL, %s) '
+                        'ON CONFLICT (scope) DO UPDATE SET '
+                        'spent_usd=taskauto_budget.spent_usd-%s+%s',
+                        (scope, actual, estimate, actual))
         else:
             cur.execute('BEGIN IMMEDIATE')
+            cur.execute('INSERT OR IGNORE INTO taskauto_budget(scope, '
+                        'cap_usd, spent_usd) VALUES (?, NULL, 0)', (scope,))
             cur.execute('UPDATE taskauto_budget SET '
                         'spent_usd=spent_usd-?+? WHERE scope=?',
                         (estimate, actual, scope))
@@ -175,6 +207,8 @@ def launch(task_id, model=None, opts=None):
     opts.setdefault('timeout', manifest.get('task_timeout_sec', 1800))
     opts.setdefault('budget_url', os.environ.get(
         'DATABASE_URL', 'sqlite:///taskauto_budget.db'))
+    # NOTE: the sqlite default above is a FILENAME resolved against HERE
+    # by BudgetStore; pass an absolute sqlite:/// path to pin elsewhere.
     wid = workflow_id_for(task_id)
     handle = DBOS.start_workflow(wfmod.task_workflow, task, prompt, opts,
                                  workflow_id=wid)

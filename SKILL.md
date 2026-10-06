@@ -57,13 +57,15 @@ python runner.py reset [--only ...]
 ```
 
 - Dispatch: `opencode run --agent <agent> -m <model> --title "<id> <title>" --format json <prompt>`; stdout+stderr to `logs/<id>.log`.
-- A task is DONE only on exit 0 AND all done-checks true. Anything else
-  is `failed` (retryable) or `stalled` (killed by watchdog, retryable).
+- A task is DONE only on exit 0 AND all done-checks true. Other outcomes
+  are `failed` or `stalled` (killed by watchdog); each carries a
+  `retryable` flag per the policy below.
 - `waiting` tasks re-check gates every invocation; nothing executes early.
 - Retry policy: timeouts/stalls and nonzero-exits whose artifact checks
   still pass are `retryable`; `--max-retries N` re-dispatches them
   in-process up to N times (attempt counter survives in state.json), stalled
-  tasks included. Nonzero-exits with failing checks need human review,
+  tasks included. Exit 0 with failing checks (claimed success, nothing
+  verifiable) and nonzero-exits with failing checks need human review,
   never auto-retry.
 - `--budget USD` halts before the next dispatch once the ledger total
   reaches the cap.

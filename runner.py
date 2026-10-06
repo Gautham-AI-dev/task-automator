@@ -113,9 +113,12 @@ def parse_cost(log):
 
     Returns dict with tokens_in/tokens_out/cost plus completeness flags.
     Known upstream gap (opencode #26855): `run --format json` can exit on
-    idle before emitting the final step_finish event, so a log whose last
-    event is text/step_start with no step_finish is flagged
-    complete=False rather than silently under-counting."""
+    idle before emitting the final step_finish event. Only a log whose
+    LAST event is step_finish counts as complete=True; a log with
+    earlier-but-not-final step_finish events is flagged
+    partial-step-finish (sums are a lower bound), and a log with none at
+    all is flagged no-step-finish. Both cases need session DB/export
+    reconciliation rather than trusted totals."""
     tin = tout = 0
     cost = 0.0
     n_step_finish = 0
@@ -191,12 +194,15 @@ def failure_class(rc, stalled, checks):
 
     Returns (retryable: bool, label: str). Timeouts/stalls are transient;
     nonzero exits with passing artifact checks are transient (agent died
-    after doing the work); nonzero exits with failing checks need a human
-    look before burning more budget."""
+    after doing the work); anything else — nonzero exit with failing
+    checks, or exit 0 with failing checks (agent claimed success but
+    produced nothing verifiable) — needs a human look."""
     if stalled or rc in (124, 125):
         return True, 'timeout/stall'
     if rc != 0 and all(checks):
         return True, 'nonzero-exit-checks-pass'
+    if rc == 0:
+        return False, 'zero-exit-checks-fail'
     return False, 'nonzero-exit-checks-fail'
 
 

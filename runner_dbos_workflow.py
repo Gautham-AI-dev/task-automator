@@ -26,10 +26,10 @@ def define_app(DBOS, mod):
     @DBOS.step(retries_allowed=False)
     async def step_dispatch(task, prompt, model, timeout, logdir):
         # Timeout precedence: the asyncio.wait_for below owns the timeout
-        # (rc 124 path). Set the decorator's timeout_seconds HIGHER than any
-        # configured task timeout so the decorator never wins with a
-        # different error shape; DBOS step timeouts are async-only, which is
-        # why this step is a coroutine (sync steps cannot time out).
+        # (rc 124 path). The decorator deliberately sets NO
+        # timeout_seconds, so it can never win with a different error
+        # shape; the step is a coroutine regardless (DBOS timeouts are
+        # async-only; sync steps cannot time out).
         os.makedirs(logdir, exist_ok=True)
         log = os.path.join(logdir, task['id'] + '.log')
         cmd = ['opencode', 'run', '--agent', task['agent'], '-m', model,
@@ -124,10 +124,11 @@ def define_app(DBOS, mod):
             step_notify_runbook(task['id'], 'non-done: %s' % (final,))
         if opts.get('needs_approval') and final.get('status') == 'done':
             # Approval arrives at THIS workflow's inbox (approve --wid
-            # <this-workflow-id>); 'approver' only gets a notification copy.
-            # Single timeout via DBOS.recv (no asyncio.wait_for wrapper:
-            # two competing timers produced two different error shapes).
-            DBOS.send('approver', {'task': task['id'], 'result': final})
+            # <this-workflow-id>); approvers find pending items via
+            # workflow status queries, not via a message to a hardcoded
+            # 'approver' address (no such workflow exists). Single timeout
+            # via DBOS.recv (no asyncio.wait_for wrapper: two competing
+            # timers produced two different error shapes).
             try:
                 msg = DBOS.recv(timeout=float(opts.get('approval_timeout',
                                                        7 * 86400)))

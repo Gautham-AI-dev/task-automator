@@ -148,8 +148,9 @@ def _mini_manifest(outdir):
 
 
 def test_legacy_done_reruns():
-    # pre-upgrade done entry without run_start: fail-safe re-run path
-    # (dispatches once via stubbed dispatch), then carries run_start.
+    # pre-upgrade done entry without run_start: fail-safe re-run path,
+    # then carries run_start. dispatch is STUBBED: this test must never
+    # launch a real opencode process, even where opencode is installed.
     import tempfile
     import unittest.mock as mock
     d = tempfile.mkdtemp()
@@ -168,7 +169,12 @@ def test_legacy_done_reruns():
     open(f, 'w').write('x')
     import time
     os.utime(f, (time.time() + 5, time.time() + 5))
-    with mock.patch.object(runner, 'HERE', d):
+
+    def fake_dispatch(task, prompt, model, timeout, ld, stall_after):
+        return 0, False  # exit 0; artifact above satisfies done-check
+
+    with mock.patch.object(runner, 'HERE', d), \
+         mock.patch.object(runner, 'dispatch', fake_dispatch):
         st = runner.load_state(spath)
         runner.run_tasks(man, prompts, st, spath, ['T01'], 'm', 60,
                          False, None, 0)
