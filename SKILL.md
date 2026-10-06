@@ -51,6 +51,7 @@ and skip, failed tasks retry, waiting tasks re-check gates.
 python runner.py status [--only T01,..] [--state FILE]
 python runner.py dry-run [--only ...]     # zero side effects, writes no state
 python runner.py run [--only ...] [--model ...] [--state FILE]
+  [--budget USD] [--max-retries N]
 python runner.py resume [...]             # identical to run; skips done
 python runner.py reset [--only ...]
 ```
@@ -59,12 +60,22 @@ python runner.py reset [--only ...]
 - A task is DONE only on exit 0 AND all done-checks true. Anything else
   is `failed` (retryable) or `stalled` (killed by watchdog, retryable).
 - `waiting` tasks re-check gates every invocation; nothing executes early.
+- Retry policy: timeouts/stalls and nonzero-exits whose artifact checks
+  still pass are `retryable` (`--max-retries N` to auto-flag them);
+  nonzero-exits with failing checks need human review, never auto-retry.
+- `--budget USD` halts before the next dispatch once the ledger total
+  reaches the cap.
 
 ## Cost ledger (`ledger.jsonl`, one line per finished task)
 
 Parsed from `--format json` step_finish events: input/output tokens and
 cost. Feeds cost-guard budgeting. Stuck detection: the watchdog kills runs
 whose log stops growing for `stall_after_sec` and marks them `stalled`.
+
+Known upstream gap (opencode #26855): `run --format json` can exit on
+idle before emitting the final step_finish event. Ledger entries parsed
+from such logs carry `complete: false` plus a reconcile warning — do not
+treat their totals as authoritative; reconcile via the session DB/export.
 
 ## Resume contract (the core guarantee)
 

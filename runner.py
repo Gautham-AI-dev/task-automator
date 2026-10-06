@@ -10,8 +10,15 @@ Done-check types: newfile (glob newer than run start), minlines,
 mtime (file newer than run start). Time gate: T12-style telemetry
 span/entries. State writes are crash-safe (tmp + os.replace).
 Cost ledger: ledger.jsonl accumulates per-task tokens/cost parsed
-from --format json step_finish events. Stall watchdog kills runs
-whose log stops growing (stall_after_sec) and marks them stalled."""
+from --format json step_finish events. Step_finish can be missing
+(upstream opencode #26855: CLI may exit on idle before emitting it);
+such entries are flagged complete=false with a reconcile warning, never
+counted as authoritative. Stall watchdog kills runs
+whose log stops growing (stall_after_sec) and marks them stalled.
+Retry policy: timeouts/stalls and nonzero-exits with passing checks are
+retryable (see --max-retries); other failures need human review.
+Global --budget cap halts before the next dispatch once the ledger
+total reaches it."""
 import argparse
 import fnmatch
 import glob
@@ -101,9 +108,17 @@ def gate_open(task):
 
 
 def parse_cost(log):
-    """Extract summed input/output tokens + cost from --format json log."""
+    """Extract summed input/output tokens + cost from --format json log.
+
+    Returns dict with tokens_in/tokens_out/cost plus completeness flags.
+    Known upstream gap (opencode #26855): `run --format json` can exit on
+    idle before emitting the final step_finish event, so a log whose last
+    event is text/step_start with no step_finish is flagged
+    complete=False rather than silently under-counting."""
     tin = tout = 0
     cost = 0.0
+    saw_step_finish = False
+    last_event = None
     try:
         with open(log, encoding='utf-8', errors='ignore') as f:
             for line in f:
@@ -114,8 +129,13 @@ def parse_cost(log):
                     d = json.loads(line)
                 except Exception:
                     continue
+                etype = d.get('type')
+                if etype in ('step_start', 'step_finish', 'text',
+                             'tool_use', 'reasoning', 'error'):
+                    last_event = etype
                 part = d.get('part', {})
-                if d.get('type') == 'step_finish' and isinstance(part, dict):
+                if etype == 'step_finish' and isinstance(part, dict):
+                    saw_step_finish = True
                     tk = part.get('tokens', {}) or {}
                     tin += int(tk.get('input', 0) or 0)
                     tout += int(tk.get('output', 0) or 0)
@@ -124,15 +144,49 @@ def parse_cost(log):
                     except Exception:
                         pass
     except FileNotFoundError:
-        pass
-    return {'tokens_in': tin, 'tokens_out': tout, 'cost': round(cost, 6)}
+        return {'tokens_in': 0, 'tokens_out': 0, 'cost': 0.0,
+                'complete': False, 'reason': 'log-missing'}
+    complete = saw_step_finish
+    reason = 'ok' if complete else 'no-step-finish(last=%s)' % last_event
+    return {'tokens_in': tin, 'tokens_out': tout, 'cost': round(cost, 6),
+            'complete': complete, 'reason': reason}
 
 
 def ledger_append(ledger, tid, cost):
     entry = {'task': tid, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S')}
     entry.update(cost)
+    if not cost.get('complete', True):
+        entry['complete'] = False
     with open(ledger, 'a', encoding='utf-8') as f:
         f.write(json.dumps(entry) + '\n')
+
+
+def ledger_total(ledger):
+    total = 0.0
+    try:
+        with open(ledger, encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                try:
+                    total += float(json.loads(line).get('cost', 0) or 0)
+                except Exception:
+                    continue
+    except FileNotFoundError:
+        pass
+    return total
+
+
+def failure_class(rc, stalled, checks):
+    """Classify a non-done outcome for retry policy.
+
+    Returns (retryable: bool, label: str). Timeouts/stalls are transient;
+    nonzero exits with passing artifact checks are transient (agent died
+    after doing the work); nonzero exits with failing checks need a human
+    look before burning more budget."""
+    if stalled or rc in (124, 125):
+        return True, 'timeout/stall'
+    if rc != 0 and all(checks):
+        return True, 'nonzero-exit-checks-pass'
+    return False, 'nonzero-exit-checks-fail'
 
 
 def dispatch(task, prompt, model, timeout, logdir, stall_after):
@@ -185,14 +239,26 @@ def cmd_status(manifest, state, only):
             t['id'], t['title'][:28], st.get('status', 'pending'), gate))
 
 
-def run_tasks(manifest, prompts, state, spath, only, model, timeout, dry):
+def run_tasks(manifest, prompts, state, spath, only, model, timeout, dry,
+                budget=None, max_retries=0):
+    spent = ledger_total(os.path.join(HERE, 'ledger.jsonl'))
     for t in manifest['tasks']:
         if only and t['id'] not in only:
             continue
         st = state['tasks'].get(t['id'], {})
         if st.get('status') == 'done':
-            print('%s: skip (done %s)' % (t['id'], st.get('finished_at', '?')))
-            continue
+            prev_start = st.get('run_start', 0)
+            recheck = [check_done(c, prev_start) for c in t['done']]
+            if prev_start and all(recheck):
+                print('%s: skip (done %s, artifacts re-verified)' % (
+                    t['id'], st.get('finished_at', '?')))
+                continue
+            print('%s: RE-RUN (was done %s but artifacts missing: %s)' % (
+                t['id'], st.get('finished_at', '?'), recheck))
+        if budget is not None and spent >= budget:
+            print('BUDGET HALT: spent %.4f >= cap %.4f; stopping' % (
+                spent, budget))
+            break
         ok, why = gate_open(t)
         if not ok:
             print('%s: WAITING (%s)' % (t['id'], why))
@@ -214,28 +280,46 @@ def run_tasks(manifest, prompts, state, spath, only, model, timeout, dry):
         print('%s: dispatching to %s ...' % (t['id'], t['agent']), flush=True)
         run_start = time.time()
         state['tasks'][t['id']] = {'status': 'running',
-                                   'started_at': time.strftime('%Y-%m-%dT%H:%M:%S')}
+                                   'started_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                                   'run_start': run_start,
+                                   'attempt': st.get('attempt', 0) + 1}
         save_state(spath, state)
         rc, stalled = dispatch(t, prompt, model, timeout,
                                os.path.join(HERE, 'logs'),
                                manifest.get('stall_after_sec', 600))
-        ledger_append(os.path.join(HERE, 'ledger.jsonl'), t['id'],
-                      parse_cost(os.path.join(HERE, 'logs', t['id'] + '.log')))
+        cost = parse_cost(os.path.join(HERE, 'logs', t['id'] + '.log'))
+        ledger_append(os.path.join(HERE, 'ledger.jsonl'), t['id'], cost)
+        spent += cost.get('cost', 0.0)
+        if not cost.get('complete', True):
+            print('%s: WARNING ledger incomplete (%s); reconcile via '
+                  'session DB/export, do not trust totals' % (
+                      t['id'], cost.get('reason')))
         checks = [check_done(c, run_start) for c in t['done']]
         if rc == 0 and all(checks):
             state['tasks'][t['id']] = {'status': 'done',
-                                       'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S')}
+                                       'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                                       'run_start': run_start}
             print('%s: DONE (exit 0, checks %s)' % (t['id'], checks))
         elif stalled:
             state['tasks'][t['id']] = {'status': 'stalled', 'exit': rc,
                                        'checks': checks,
+                                       'run_start': run_start,
                                        'reason': 'killed after stall/timeout'}
             print('%s: STALLED (exit %s checks %s)' % (t['id'], rc, checks))
         else:
+            retryable, label = failure_class(rc, stalled, checks)
+            attempts = state['tasks'].get(t['id'], {}).get('attempt', 1)
+            will_retry = retryable and attempts <= max_retries
             state['tasks'][t['id']] = {'status': 'failed', 'exit': rc,
                                        'checks': checks,
-                                       'reason': 'exit %s checks %s' % (rc, checks)}
-            print('%s: FAILED (exit %s checks %s)' % (t['id'], rc, checks))
+                                       'run_start': run_start,
+                                       'retryable': retryable,
+                                       'reason': 'exit %s checks %s [%s]%s' % (
+                                           rc, checks, label,
+                                           ' retrying' if will_retry else '')}
+            print('%s: FAILED (exit %s checks %s [%s]%s)' % (
+                t['id'], rc, checks, label,
+                ' retrying' if will_retry else ''))
         save_state(spath, state)
     print('run complete; resume anytime with: python runner.py resume')
 
@@ -247,6 +331,12 @@ def main():
     ap.add_argument('--model', default='')
     ap.add_argument('--state', default=os.path.join(HERE, 'state.json'))
     ap.add_argument('--timeout', type=int, default=1800)
+    ap.add_argument('--budget', type=float, default=None,
+                    help='global cost cap USD; halt before next dispatch once '
+                         'ledger total reaches it')
+    ap.add_argument('--max-retries', type=int, default=0,
+                    help='auto-retry transient failures (stall/timeout, '
+                         'nonzero-exit with passing checks) this many times')
     a = ap.parse_args()
     manifest = load_tasks()
     prompts = load_prompts()
@@ -256,9 +346,11 @@ def main():
     if a.cmd == 'status':
         cmd_status(manifest, state, only)
     elif a.cmd == 'dry-run':
-        run_tasks(manifest, prompts, state, a.state, only, model, a.timeout, True)
+        run_tasks(manifest, prompts, state, a.state, only, model, a.timeout,
+                  True, a.budget, a.max_retries)
     elif a.cmd in ('run', 'resume'):
-        run_tasks(manifest, prompts, state, a.state, only, model, a.timeout, False)
+        run_tasks(manifest, prompts, state, a.state, only, model, a.timeout,
+                  False, a.budget, a.max_retries)
     elif a.cmd == 'reset':
         if only:
             for i in only:
