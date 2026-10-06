@@ -181,8 +181,7 @@ def test_ledger_per_attempt_rows():
     print('PASS ledger-per-attempt')
 
 
-def test_ledger_rejects_unknown_outcome():
-    # schema guard: 'unknown' (or anything outside the enum) fails loud at
+def test_ledger_rejects_unknown_outcome():    # schema guard: 'unknown' (or anything outside the enum) fails loud at
     # the call site instead of writing a bad row.
     import tempfile
     d = tempfile.mkdtemp()
@@ -392,6 +391,55 @@ def test_retry_loop():
     print('PASS retry-loop')
 
 
+def test_consumer_costs_compat():
+    # CRITICAL-PATH CONTRACT: OSD's verification panel (/costs) sums
+    # tokens_in/tokens_out/cost per ledger row with .get() defaults.
+    # Old-schema rows (pre-upgrade, no attempt/outcome), new per-attempt
+    # rows, incomplete rows, and corrupt lines must ALL survive the same
+    # summation. Replicates server.py costs_html aggregation exactly.
+    import json
+    import tempfile
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, 'ledger.jsonl')
+    rows = [
+        {'task': 'T11', 'finished_at': 't', 'tokens_in': 100,
+         'tokens_out': 10, 'cost': 0.0},  # old schema
+        {'task': 'T01', 'attempt': 1, 'outcome': 'attempt-failed',
+         'finished_at': 't', 'tokens_in': 50, 'tokens_out': 5,
+         'cost': 0.01, 'complete': True, 'reason': 'ok'},
+        {'task': 'T01', 'attempt': 2, 'outcome': 'done',
+         'finished_at': 't', 'tokens_in': 60, 'tokens_out': 6,
+         'cost': 0.02, 'complete': False,  # incomplete still counts
+         'reason': 'partial-step-finish(1 seen, last=text)'},
+        'not json at all',  # corrupt line: skipped, never fatal
+    ]
+    with open(p, 'w') as f:
+        for r in rows:
+            f.write((r if isinstance(r, str) else json.dumps(r)) + '\n')
+
+    def costs_sum(ledger):  # mirrors ui/server.py costs_html()
+        tin = tout = 0
+        cost = 0.0
+        n = 0
+        with open(ledger, encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                n += 1
+                tin += int(r.get('tokens_in', 0) or 0)
+                tout += int(r.get('tokens_out', 0) or 0)
+                cost += float(r.get('cost', 0) or 0)
+        return n, tin, tout, round(cost, 6)
+
+    assert costs_sum(p) == (3, 210, 21, 0.03), costs_sum(p)
+    assert abs(runner.ledger_total(p) - 0.03) < 1e-9  # same total
+    print('PASS consumer-costs-compat')
+
+
 if __name__ == '__main__':
     test_markers()
     test_state_crashsafe()
@@ -409,4 +457,5 @@ if __name__ == '__main__':
     test_dry_run_ignores_budget_halt()
     test_rerun_resets_attempts()
     test_retry_suppressed_over_budget()
+    test_consumer_costs_compat()
     print('ALL PASS')

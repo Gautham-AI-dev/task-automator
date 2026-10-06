@@ -124,6 +124,7 @@ overspend). See [docs/durable.md](docs/durable.md).
 - [docs/durable.md](docs/durable.md) — DBOS layer: setup, workflows, approvals, provenance
 - [docs/comparison.md](docs/comparison.md) — vs Temporal, DBOS Transact alone, LangGraph checkpointing, cron+scripts
 - [docs/faq.md](docs/faq.md) — opencode models, Windows/Linux/macOS, CI use, troubleshooting
+- [docs/regression-gate.md](docs/regression-gate.md) — critical-path merge gate (suites + `/costs` contract)
 - [SKILL.md](SKILL.md) — agent-skill contract (frontmatter + resume guarantee + neighbor map)
 
 ## Tests
