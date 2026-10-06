@@ -12,16 +12,19 @@ are covered by tests/test_runner_dbos.py.
 
 Design (one workflow per task: short histories, no long sleeps):
   launch -> DBOS.start_workflow(task_workflow, task, prompt, opts)
-  workflow: acquire budget (step) -> dispatch agent (async step bounded
-    by timeout_seconds) -> verify artifacts (step) ->
-    settle budget actuals (step) -> optional approval wait
-    (durable recv with timeout; fail-closed on timeout).
+  workflow: acquire budget (step) -> dispatch agent (async step, bounded
+    by asyncio.wait_for inside the step — the decorator deliberately sets
+    NO timeout_seconds so it can never win with a different error shape)
+    -> verify artifacts (step) -> settle budget actuals (step) ->
+    optional approval wait (durable recv with timeout; fail-closed on
+    timeout).
 
 DBOS rules honored (fixes for the report-code bugs):
   - every budget mutation and every side effect lives in a @step;
     the workflow body only orchestrates values returned from steps;
-  - dispatch is an ASYNC step so timeout_seconds/preemptible apply
-    (sync steps cannot time out);
+  - dispatch is an ASYNC step (DBOS timeouts are async-only; sync steps
+    cannot time out). No preemptible/decorator-timeout is claimed: the
+    bound is the in-step asyncio.wait_for (rc 124 path);
   - ledger append is a step with retries_allowed=False (a retried step
     would double-append);
   - Postgres budget ledger uses SELECT ... FOR UPDATE; the SQLite
@@ -115,6 +118,22 @@ class BudgetStore:
             self.conn = sqlite3.connect(self.path)
         self._init()
 
+    def close(self):
+        """Release the DB connection. Steps must call this (try/finally)
+        — a new store (hence a new connection) is constructed per step,
+        and without close() a catalog run leaks one PG slot per step."""
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
     def _init(self):
         cur = self.conn.cursor()
         cur.execute(self.SCHEMA)
@@ -138,7 +157,11 @@ class BudgetStore:
     def acquire(self, scope, estimate):
         """Reserve estimate; True if under cap (or uncapped). Must run
         inside a step. First touch creates the scope row (cap NULL =
-        tracked but uncapped)."""
+        tracked but uncapped). Concurrent first-touches of a shared scope
+        (e.g. run:default) are safe: PG uses ON CONFLICT DO NOTHING +
+        re-SELECT so losers fall through to the normal reserve path
+        instead of raising UniqueViolation; SQLite serializes writers via
+        BEGIN IMMEDIATE."""
         cur = self.conn.cursor()
         if self.is_pg:
             cur.execute('SELECT cap_usd, spent_usd FROM taskauto_budget '
@@ -149,12 +172,31 @@ class BudgetStore:
                         'WHERE scope=?', (scope,))
         row = cur.fetchone()
         if row is None:
-            ph = '%s' if self.is_pg else '?'
-            cur.execute('INSERT INTO taskauto_budget(scope, cap_usd, '
-                        'spent_usd) VALUES (%s, NULL, %s)' % (ph, ph),
-                        (scope, estimate))
-            self.conn.commit()
-            return True
+            if self.is_pg:
+                # RETURNING tells us exactly who won: a row comes back
+                # only if THIS statement inserted. Losers re-SELECT the
+                # winner's row and reserve normally below — no
+                # UniqueViolation, no float-guessing.
+                cur.execute('INSERT INTO taskauto_budget(scope, cap_usd, '
+                            'spent_usd) VALUES (%s, NULL, %s) '
+                            'ON CONFLICT (scope) DO NOTHING '
+                            'RETURNING scope', (scope, estimate))
+                if cur.fetchone() is not None:
+                    self.conn.commit()  # we won; estimate reserved
+                    return True
+                cur.execute('SELECT cap_usd, spent_usd FROM '
+                            'taskauto_budget WHERE scope=%s FOR UPDATE',
+                            (scope,))
+                row = cur.fetchone()
+                if row is None:  # defensive: suppressed AND vanished
+                    self.conn.rollback()
+                    return False
+            else:
+                cur.execute('INSERT INTO taskauto_budget(scope, cap_usd, '
+                            'spent_usd) VALUES (?, NULL, ?)',
+                            (scope, estimate))
+                self.conn.commit()
+                return True
         cap, spent = row
         if cap is not None and spent + estimate > cap:
             self.conn.rollback()
@@ -210,7 +252,10 @@ def launch(task_id, model=None, opts=None):
     DBOS = require_dbos()
     import runner_dbos_workflow as wfmod
     DBOS.launch()
-    wfmod.define_app(DBOS, sys.modules[__name__])
+    # define_app returns the registered callables; use the registry, NOT
+    # wfmod.task_workflow (no such module attribute exists — the workflow
+    # only lives inside define_app's closure).
+    app = wfmod.define_app(DBOS, sys.modules[__name__])
     manifest = runner.load_tasks()
     prompts = runner.load_prompts()
     task = next(t for t in manifest['tasks'] if t['id'] == task_id)
@@ -223,7 +268,7 @@ def launch(task_id, model=None, opts=None):
     # NOTE: the sqlite default above is a FILENAME resolved against HERE
     # by BudgetStore; pass an absolute sqlite:/// path to pin elsewhere.
     wid = workflow_id_for(task_id)
-    handle = DBOS.start_workflow(wfmod.task_workflow, task, prompt, opts,
+    handle = DBOS.start_workflow(app['task_workflow'], task, prompt, opts,
                                  workflow_id=wid)
     print('launched %s (workflow %s)' % (task_id, wid))
     return handle
@@ -251,6 +296,10 @@ def main(argv=None):
     ap.add_argument('--approve', default='yes', choices=['yes', 'no'])
     ap.add_argument('--wid', default='')
     ap.add_argument('--estimate', type=float, default=1.0)
+    ap.add_argument('--attempt', type=int, default=1,
+                    help='attempt number for this launch: re-launches after '
+                         'needs-operator-retry pass the next number so '
+                         'ledger rows keep attempt ordering')
     ap.add_argument('--needs-approval', action='store_true')
     a = ap.parse_args(argv)
     if a.cmd == 'launch':
@@ -260,6 +309,7 @@ def main(argv=None):
         for tid in only:
             launch(tid, a.model or None,
                    {'estimate_usd': a.estimate,
+                    'attempt': a.attempt,
                     'needs_approval': a.needs_approval})
     elif a.cmd == 'status':
         if not a.wid:

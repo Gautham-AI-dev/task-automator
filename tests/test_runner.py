@@ -196,6 +196,65 @@ def test_ledger_rejects_unknown_outcome():
     print('PASS ledger-enum-guard')
 
 
+def test_dry_run_ignores_budget_halt():
+    # dry-run previews ALL tasks even over cap (advisory, not halt);
+    # writes no state.
+    import io
+    import json
+    import tempfile
+    import unittest.mock as mock
+    from contextlib import redirect_stdout
+    d = tempfile.mkdtemp()
+    out = os.path.join(d, 'out')
+    os.makedirs(out)
+    spath = os.path.join(d, 'state.json')
+    led = os.path.join(d, 'ledger.jsonl')
+    open(led, 'w').write(json.dumps({'task': 'T9', 'cost': 9.0}) + '\n')
+    man, prompts = _mini_manifest(out), {'T01': 'do t1'}
+    buf = io.StringIO()
+    with mock.patch.object(runner, 'HERE', d), redirect_stdout(buf):
+        st = {'tasks': {}}
+        runner.run_tasks(man, prompts, st, spath, None, 'm', 60,
+                         True, 1.0, 0)  # dry=True, breached cap
+        assert st == {'tasks': {}}, st  # nothing written
+    text = buf.getvalue()
+    assert 'dry-run ok' in text, text  # previewed, not halted
+    assert 'WOULD-HALT' in text, text  # advisory present
+    print('PASS dry-run-budget')
+
+
+def test_rerun_resets_attempts():
+    # RE-RUN after vanished artifacts starts a FRESH attempt sequence
+    # (prior count preserved in prior_attempts, not inherited).
+    import tempfile
+    import unittest.mock as mock
+    d = tempfile.mkdtemp()
+    out = os.path.join(d, 'out')
+    os.makedirs(out)
+    spath = os.path.join(d, 'state.json')
+    runner.save_state(spath, {'tasks': {'T01': {
+        'status': 'done', 'finished_at': 'old',
+        'run_start': 1.0, 'attempt': 3}}})  # prior run did 3 attempts
+    man, prompts = _mini_manifest(out), {'T01': 'do t1'}
+    logdir = os.path.join(d, 'logs')
+    os.makedirs(logdir)
+
+    def fake_dispatch(task, prompt, model, timeout, ld, stall_after):
+        with open(os.path.join(logdir, task['id'] + '.log'), 'w') as lf:
+            lf.write('{"type":"step_finish","part":{"tokens":{"input":1,'
+                     '"output":1},"cost":0}}\n')
+        return 0, False  # exit 0; no artifact -> FAILED, attempt recorded
+
+    with mock.patch.object(runner, 'HERE', d), \
+         mock.patch.object(runner, 'dispatch', fake_dispatch):
+        runner.run_tasks(man, prompts, runner.load_state(spath), spath,
+                         ['T01'], 'm', 60, False, None, 0)
+        rec = runner.load_state(spath)['tasks']['T01']
+        assert rec['attempt'] == 1, rec  # fresh sequence, not 4
+        assert rec.get('prior_attempts') == 3, rec  # history kept
+    print('PASS rerun-attempts')
+
+
 def test_retry_suppressed_over_budget():
     # cap breached BY the first attempt's own cost: the retry (not the
     # initial dispatch) is suppressed. Task-level halt covers the
@@ -341,5 +400,7 @@ if __name__ == '__main__':
     test_retry_loop()
     test_ledger_per_attempt_rows()
     test_ledger_rejects_unknown_outcome()
+    test_dry_run_ignores_budget_halt()
+    test_rerun_resets_attempts()
     test_retry_suppressed_over_budget()
     print('ALL PASS')

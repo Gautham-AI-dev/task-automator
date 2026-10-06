@@ -274,6 +274,7 @@ def run_tasks(manifest, prompts, state, spath, only, model, timeout, dry,
         if only and t['id'] not in only:
             continue
         st = state['tasks'].get(t['id'], {})
+        rerun = False
         if st.get('status') == 'done':
             prev_start = st.get('run_start')
             if prev_start is None:
@@ -281,6 +282,7 @@ def run_tasks(manifest, prompts, state, spath, only, model, timeout, dry,
                 # fresh entry carries run_start and skips normally.
                 print('%s: RE-RUN (legacy done entry without run_start; '
                       'fail-safe, artifacts checked post-run)' % t['id'])
+                rerun = True
             else:
                 recheck = [check_done(c, prev_start) for c in t['done']]
                 if all(recheck):
@@ -289,7 +291,16 @@ def run_tasks(manifest, prompts, state, spath, only, model, timeout, dry,
                     continue
                 print('%s: RE-RUN (was done %s but artifacts missing: %s)' % (
                     t['id'], st.get('finished_at', '?'), recheck))
-        if budget is not None and spent >= budget:
+                rerun = True
+        over_budget = budget is not None and spent >= budget
+        if dry:
+            # dry-run previews EVERYTHING (contract: zero side effects,
+            # full visibility). A breached cap is advisory here, never a
+            # halt — the real run will enforce it before dispatching.
+            if over_budget:
+                print('%s: (BUDGET WOULD-HALT: spent %.4f >= cap %.4f)' % (
+                    t['id'], spent, budget))
+        elif over_budget:
             print('BUDGET HALT: spent %.4f >= cap %.4f; stopping' % (
                 spent, budget))
             break
@@ -312,15 +323,27 @@ def run_tasks(manifest, prompts, state, spath, only, model, timeout, dry,
                 t['id'], t['agent'], len(prompt)))
             continue
         print('%s: dispatching to %s ...' % (t['id'], t['agent']), flush=True)
-        attempt = st.get('attempt', 0)
+        # RE-RUNs (legacy entries, vanished artifacts) start a FRESH
+        # attempt sequence: prior attempts proved nothing durable, and
+        # inheriting the old count would silently shrink this run's retry
+        # allowance to zero. History is preserved in prior_attempts.
+        if rerun:
+            attempt = 0
+            prior = st.get('attempt', 0)
+        else:
+            attempt = st.get('attempt', 0)
+            prior = 0
         outcome = None
         while True:
             attempt += 1
             run_start = time.time()
-            state['tasks'][t['id']] = {
+            entry = {
                 'status': 'running',
                 'started_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
                 'run_start': run_start, 'attempt': attempt}
+            if prior:
+                entry['prior_attempts'] = prior
+            state['tasks'][t['id']] = entry
             save_state(spath, state)
             rc, stalled = dispatch(t, prompt, model, timeout,
                                    os.path.join(HERE, 'logs'),
@@ -374,6 +397,8 @@ def run_tasks(manifest, prompts, state, spath, only, model, timeout, dry,
                 t['id'], outcome[0].upper(), rc, checks,
                 '' if stalled else ' [%s]' % label, attempt))
             break
+        if prior:
+            outcome[1]['prior_attempts'] = prior
         state['tasks'][t['id']] = outcome[1]
         save_state(spath, state)
     print('run complete; resume anytime with: python runner.py resume')

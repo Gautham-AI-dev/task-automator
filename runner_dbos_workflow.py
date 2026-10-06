@@ -19,9 +19,8 @@ def define_app(DBOS, mod):
 
     @DBOS.step(retries_allowed=False)
     def step_acquire(budget_url, scopes, estimate):
-        store = mod.BudgetStore(budget_url)
-        verdicts = {s: store.acquire(s, estimate) for s in scopes}
-        return verdicts
+        with mod.BudgetStore(budget_url) as store:
+            return {s: store.acquire(s, estimate) for s in scopes}
 
     @DBOS.step(retries_allowed=False)
     async def step_dispatch(task, prompt, model, timeout, logdir):
@@ -61,30 +60,31 @@ def define_app(DBOS, mod):
         return [runner.check_done(c, run_start) for c in task['done']]
 
     @DBOS.step(retries_allowed=False)
-    def step_ledger(task_id, log, rc, checks):
+    def step_ledger(task_id, log, rc, checks, attempt):
         # Outcome is decided by the caller (exit + checks), same rule as
-        # the core runner: only exit-0-with-all-checks is done. No
-        # 'unknown' rows: every ledger row carries a documented outcome.
+        # the core runner: only exit-0-with-all-checks is done. Attempt is
+        # threaded from launch opts (operator re-launch passes the next
+        # attempt number), so re-launched retries keep attempt ordering
+        # instead of piling up duplicate attempt=1 rows. No 'unknown'
+        # rows: every ledger row carries a documented outcome.
         cost = runner.parse_cost(log)
         outcome = 'done' if (rc == 0 and all(checks)) else 'attempt-failed'
         runner.ledger_append(
             os.path.join(runner.HERE, 'ledger.jsonl'), task_id, cost,
-            attempt=1, outcome=outcome)
+            attempt=attempt, outcome=outcome)
         return cost
 
     @DBOS.step(retries_allowed=False)
     def step_settle(budget_url, scopes, estimate, actual):
-        store = mod.BudgetStore(budget_url)
-        for s in scopes:
-            store.settle(s, estimate, actual)
+        with mod.BudgetStore(budget_url) as store:
+            for s in scopes:
+                store.settle(s, estimate, actual)
 
     @DBOS.step(retries_allowed=False)
     def step_release(budget_url, scopes, estimate):
-        store = mod.BudgetStore(budget_url)
-        for s in scopes:
-            store.settle(s, estimate, 0.0)
-
-    @DBOS.step(retries_allowed=True, max_attempts=3)
+        with mod.BudgetStore(budget_url) as store:
+            for s in scopes:
+                store.settle(s, estimate, 0.0)
     def step_notify_runbook(task_id, reason):
         # delivery to pager/runbook goes here; retryable by design.
         # STUB (unexecuted): wire to the real runbook channel before
@@ -117,7 +117,7 @@ def define_app(DBOS, mod):
         cost = step_ledger(task['id'],
                            os.path.join(runner.HERE, 'logs',
                                         task['id'] + '.log'),
-                           rc, checks)
+                           rc, checks, int(opts.get('attempt', 1)))
         step_settle(opts['budget_url'], scopes, estimate,
                     float(cost.get('cost', 0.0)))
         if rc == 0 and all(checks):

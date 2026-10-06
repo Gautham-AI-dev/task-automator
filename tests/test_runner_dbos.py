@@ -100,6 +100,24 @@ def test_budget_sqlite_path_resolution():
     print('PASS budget-paths')
 
 
+def test_budget_store_closes():
+    # context-manager use must close the connection (no per-step leak)
+    os.environ['TASK_AUTO_SINGLE_WORKER'] = '1'
+    try:
+        d = tempfile.mkdtemp()
+        with m.BudgetStore('sqlite:///' + os.path.join(d, 'b.db')) as s:
+            assert s.acquire('run:x', 1.0) is True
+        try:
+            s.conn.execute('SELECT 1')
+        except Exception:
+            pass  # closed: ProgrammingError expected (impl detail)
+        else:
+            raise AssertionError('connection should be closed after with')
+    finally:
+        del os.environ['TASK_AUTO_SINGLE_WORKER']
+    print('PASS budget-close')
+
+
 def test_budget_sqlite_refused_multiworker():
     os.environ.pop('TASK_AUTO_SINGLE_WORKER', None)
     try:
@@ -118,8 +136,7 @@ def test_failure_class_zero_exit():
     print('PASS failure-class-zero')
 
 
-def test_pg_settle_statement_shape():
-    # No live Postgres here: pin the SQL contract with a fake cursor.
+def test_pg_settle_statement_shape():    # No live Postgres here: pin the SQL contract with a fake cursor.
     # Fresh row must store ACTUAL (params[1]); conflict branch must
     # compute spent - estimate + actual (params[2], params[3]).
     seen = {}
@@ -142,6 +159,108 @@ def test_pg_settle_statement_shape():
     print('PASS pg-settle-shape')
 
 
+def test_pg_acquire_lost_race():
+    # Lost first-touch race: RETURNING comes back empty (winner inserted),
+    # re-SELECT finds the winner's row, reservation proceeds normally.
+    # No UniqueViolation may escape: ON CONFLICT DO NOTHING is mandatory.
+    script = iter([
+        None,   # initial SELECT ... FOR UPDATE: no row yet
+        None,   # RETURNING: empty -> we lost the race
+        (None, 5.0),  # re-SELECT: winner's row (uncapped, spent 5)
+    ])
+    seen = []
+
+    class FakeCur:
+        def execute(self, sql, params):
+            seen.append((sql, params))
+
+        def fetchone(self):
+            return next(script)
+
+    store = m.BudgetStore.__new__(m.BudgetStore)
+    store.is_pg = True
+    store.conn = type('C', (), {'cursor': lambda self: FakeCur(),
+                                'commit': lambda self: seen.append(
+                                    ('COMMIT', ())),
+                                'rollback': lambda self: seen.append(
+                                    ('ROLLBACK', ()))})()
+    assert store.acquire('run:default', 1.0) is True
+    assert any('ON CONFLICT (scope) DO NOTHING' in s for s, _ in seen), seen
+    assert any('RETURNING scope' in s for s, _ in seen), seen
+    assert any(s == 'COMMIT' for s, _ in seen), seen
+    print('PASS pg-acquire-race')
+
+
+def test_pg_acquire_won_race():
+    # Won first-touch race: RETURNING yields the scope; single commit,
+    # no follow-up UPDATE (estimate already stored by our INSERT).
+    script = iter([None, ('run:x',)])
+
+    class FakeCur:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, sql, params):
+            self.statements.append((sql, params))
+
+        def fetchone(self):
+            return next(script)
+
+    cur = FakeCur()
+    store = m.BudgetStore.__new__(m.BudgetStore)
+    store.is_pg = True
+    store.conn = type('C', (), {'cursor': lambda self: cur,
+                                'commit': lambda self: cur.statements.append(
+                                    ('COMMIT', ())),
+                                'rollback': lambda self: None})()
+    assert store.acquire('run:x', 2.0) is True
+    assert not any(s.startswith('UPDATE') for s, _ in cur.statements), \
+        cur.statements
+    print('PASS pg-acquire-won')
+
+
+def test_launch_uses_registry_not_module_attr():
+    # Regression: launch() once read wfmod.task_workflow (AttributeError:
+    # no module-level attribute; the workflow lives in define_app's
+    # closure). It must use the dict define_app returns. Fake DBOS +
+    # fake workflow module exercise the wiring without dbos installed.
+    import unittest.mock as mock
+    sentinel = object()
+    started = {}
+
+    class FakeDBOS:
+        def launch(self):
+            pass
+
+        def start_workflow(self, fn, task, prompt, opts, workflow_id=None):
+            started['fn'] = fn
+            started['wid'] = workflow_id
+            return 'handle'
+
+    fake_wfmod = type('W', (), {
+        'define_app': staticmethod(lambda dbos, mod: {
+            'task_workflow': sentinel}),
+        })()
+    manifest = {'default_model': 'm', 'tasks': [
+        {'id': 'T01', 'title': 't', 'agent': 'a', 'section': 'T01'}]}
+    import sys
+    # launch() does a function-local `import runner_dbos_workflow`, so
+    # sys.modules patching is the seam (no dbos installation needed).
+    with mock.patch.object(m, 'require_dbos', return_value=FakeDBOS()), \
+         mock.patch.object(sys, 'modules',
+                           {**sys.modules,
+                            'runner_dbos_workflow': fake_wfmod}), \
+         mock.patch('runner.load_tasks', return_value=manifest), \
+         mock.patch('runner.load_prompts', return_value={'T01': 'p'}), \
+         mock.patch.object(m, 'workflow_id_for',
+                           return_value='taskauto-T01-X'):
+        h = m.launch('T01')
+    assert h == 'handle', h
+    assert started['fn'] is sentinel, started  # registry fn, not module attr
+    assert started['wid'] == 'taskauto-T01-X', started
+    print('PASS launch-registry')
+
+
 if __name__ == '__main__':
     test_import_without_dbos()
     test_workflow_id()
@@ -149,7 +268,11 @@ if __name__ == '__main__':
     test_budget_sqlite_single_worker()
     test_budget_settle_upsert()
     test_budget_sqlite_path_resolution()
+    test_budget_store_closes()
     test_budget_sqlite_refused_multiworker()
     test_failure_class_zero_exit()
     test_pg_settle_statement_shape()
+    test_pg_acquire_lost_race()
+    test_pg_acquire_won_race()
+    test_launch_uses_registry_not_module_attr()
     print('ALL PASS')
