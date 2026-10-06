@@ -166,22 +166,37 @@ class BudgetStore:
         return True
 
     def settle(self, scope, estimate, actual):
-        """Replace estimate with actual. Upserts: never a silent no-op on
-        unknown scopes. Must run inside a step."""
+        """Replace the outstanding estimate with actual. Upserts: never a
+        silent no-op on unknown scopes. Both backends share one semantic:
+        spent = COALESCE(existing, estimate) - estimate + actual, so a
+        fresh row records exactly actual on PG and SQLite alike. Must run
+        inside a step."""
         cur = self.conn.cursor()
         if self.is_pg:
+            # Proposed row carries the estimate; the call carries actual.
+            # Fresh row: existing spend is implicitly the estimate, so the
+            # result is exactly actual. Existing row: spend-estimate+actual.
+            # One statement, no read-modify-write race under FOR UPDATE
+            # callers (acquire holds the lock; settle runs in its own step).
             cur.execute('INSERT INTO taskauto_budget(scope, cap_usd, '
                         'spent_usd) VALUES (%s, NULL, %s) '
-                        'ON CONFLICT (scope) DO UPDATE SET '
-                        'spent_usd=taskauto_budget.spent_usd-%s+%s',
-                        (scope, actual, estimate, actual))
+                        'ON CONFLICT (scope) DO UPDATE SET spent_usd='
+                        'taskauto_budget.spent_usd-EXCLUDED.spent_usd+%s',
+                        (scope, estimate, actual))
         else:
             cur.execute('BEGIN IMMEDIATE')
-            cur.execute('INSERT OR IGNORE INTO taskauto_budget(scope, '
-                        'cap_usd, spent_usd) VALUES (?, NULL, 0)', (scope,))
-            cur.execute('UPDATE taskauto_budget SET '
-                        'spent_usd=spent_usd-?+? WHERE scope=?',
-                        (estimate, actual, scope))
+            cur.execute('SELECT spent_usd FROM taskauto_budget '
+                        'WHERE scope=?', (scope,))
+            if cur.fetchone() is None:
+                # Fresh row: no outstanding estimate exists, so the row
+                # starts at actual (mirrors the PG fresh-row branch).
+                cur.execute('INSERT INTO taskauto_budget(scope, cap_usd, '
+                            'spent_usd) VALUES (?, NULL, ?)',
+                            (scope, actual))
+            else:
+                cur.execute('UPDATE taskauto_budget SET '
+                            'spent_usd=spent_usd-?+? WHERE scope=?',
+                            (estimate, actual, scope))
         self.conn.commit()
 
 

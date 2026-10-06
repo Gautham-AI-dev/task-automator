@@ -140,6 +140,83 @@ def test_ledger_total():
     print('PASS ledger-total')
 
 
+def test_ledger_per_attempt_rows():
+    # retried tasks write one row PER ATTEMPT with attempt/outcome fields
+    import json
+    import tempfile
+    import unittest.mock as mock
+    d = tempfile.mkdtemp()
+    out = os.path.join(d, 'out')
+    os.makedirs(out)
+    spath = os.path.join(d, 'state.json')
+    man, prompts = _mini_manifest(out), {'T01': 'do t1'}
+    logdir = os.path.join(d, 'logs')
+    os.makedirs(logdir)
+
+    def fake_dispatch(task, prompt, model, timeout, ld, stall_after):
+        with open(os.path.join(logdir, task['id'] + '.log'), 'w') as lf:
+            lf.write('{"type":"step_finish","part":{"tokens":{"input":1,'
+                     '"output":1},"cost":0.5}}\n')
+        import time as _t
+        now = _t.time() + 5
+        f = os.path.join(out, 'health-x.md')
+        open(f, 'w').write('x')
+        os.utime(f, (now, now))
+        return 1, False
+
+    with mock.patch.object(runner, 'HERE', d), \
+         mock.patch.object(runner, 'dispatch', fake_dispatch):
+        runner.run_tasks(man, prompts, {'tasks': {}}, spath, ['T01'], 'm',
+                         60, False, None, 1)
+    rows = [json.loads(ln) for ln in
+            open(os.path.join(d, 'ledger.jsonl')) if ln.strip()]
+    assert len(rows) == 2, rows
+    assert [r['attempt'] for r in rows] == [1, 2], rows
+    assert rows[-1]['outcome'] == 'done' or \
+        rows[-1]['outcome'] == 'attempt-failed', rows
+    assert abs(runner.ledger_total(os.path.join(d, 'ledger.jsonl'))
+               - 1.0) < 1e-9
+    print('PASS ledger-per-attempt')
+
+
+def test_retry_suppressed_over_budget():
+    # cap breached BY the first attempt's own cost: the retry (not the
+    # initial dispatch) is suppressed. Task-level halt covers the
+    # pre-breached case separately.
+    import tempfile
+    import unittest.mock as mock
+    d = tempfile.mkdtemp()
+    out = os.path.join(d, 'out')
+    os.makedirs(out)
+    spath = os.path.join(d, 'state.json')
+    man, prompts = _mini_manifest(out), {'T01': 'do t1'}
+    logdir = os.path.join(d, 'logs')
+    os.makedirs(logdir)
+    calls = []
+
+    def fake_dispatch(task, prompt, model, timeout, ld, stall_after):
+        calls.append(1)
+        with open(os.path.join(logdir, task['id'] + '.log'), 'w') as lf:
+            lf.write('{"type":"step_finish","part":{"tokens":{"input":1,'
+                     '"output":1},"cost":5.0}}\n')  # blows the 1.0 cap
+        import time as _t
+        now = _t.time() + 5
+        f = os.path.join(out, 'health-x.md')
+        open(f, 'w').write('x')
+        os.utime(f, (now, now))
+        return 1, False  # transient: nonzero-exit, checks pass
+
+    with mock.patch.object(runner, 'HERE', d), \
+         mock.patch.object(runner, 'dispatch', fake_dispatch):
+        st = {'tasks': {}}
+        runner.run_tasks(man, prompts, st, spath, ['T01'], 'm', 60,
+                         False, 1.0, 3)
+        assert len(calls) == 1, calls  # initial attempt only, no retry
+        rec = runner.load_state(spath)['tasks']['T01']
+        assert 'retry suppressed' in rec['reason'], rec
+    print('PASS retry-budget-suppress')
+
+
 def _mini_manifest(outdir):
     return {'default_model': 'm', 'stall_after_sec': 600, 'tasks': [
         {'id': 'T01', 'title': 't1', 'agent': 'a', 'section': 'T01',
@@ -245,4 +322,6 @@ if __name__ == '__main__':
     test_ledger_total()
     test_legacy_done_reruns()
     test_retry_loop()
+    test_ledger_per_attempt_rows()
+    test_retry_suppressed_over_budget()
     print('ALL PASS')

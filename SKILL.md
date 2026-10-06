@@ -70,18 +70,25 @@ python runner.py reset [--only ...]
 - `--budget USD` halts before the next dispatch once the ledger total
   reaches the cap.
 
-## Cost ledger (`ledger.jsonl`, one line per finished task)
+## Cost ledger (`ledger.jsonl`, one row per attempt)
 
 Parsed from `--format json` step_finish events: input/output tokens and
-cost. Feeds cost-guard budgeting. Stuck detection: the watchdog kills runs
+cost. Every dispatch writes a row — including failed and retried attempts,
+since every attempt costs money. Rows carry `task`, `attempt`, `outcome`
+(`done` | `attempt-failed`) and `finished_at`: sum rows by task for total
+spend, or take the highest-attempt row for the final outcome. Feeds
+cost-guard budgeting. Stuck detection: the watchdog kills runs
 whose log stops growing for `stall_after_sec` and marks them `stalled`.
 
 Known upstream gap (opencode #26855): `run --format json` can exit on
 idle before emitting the final step_finish event. Only a log whose LAST
 event is step_finish counts as `complete: true`; earlier-but-not-final
 step_finish sums are flagged `partial-step-finish` and treated as lower
-bounds (the `--budget` cap enforces against them conservatively) — do not
-treat their totals as authoritative; reconcile via the session DB/export.
+bounds — the `--budget` cap therefore halts LATE (permissive, not
+conservative) when rows are incomplete: true spend may already exceed the
+cap. Treat any run with incomplete rows as needing session DB/export
+reconciliation before trusting totals; do not treat their totals as
+authoritative.
 
 ## Resume contract (the core guarantee)
 
@@ -113,8 +120,9 @@ step so timeouts apply (DBOS step timeouts are async-only); ledger append
 is non-retried; budget caps live in Postgres with `SELECT ... FOR UPDATE`
 (SQLite only with `TASK_AUTO_SINGLE_WORKER=1`, otherwise refused);
 approval waits use a single `DBOS.recv` timeout on the workflow's own
-inbox (`approve --wid` targets it; `approver` gets a notification copy
-only), fail-closed on timeout/unclear messages.
+inbox (`approve --wid` targets it; approvers discover pending items via
+workflow status queries — no side-channel notify exists), fail-closed on
+timeout/unclear messages.
 
 Provenance: the workflow file is reviewed but UNEXECUTED (dbos +
 Postgres unavailable where built) — run it against Postgres before

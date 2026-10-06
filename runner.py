@@ -15,7 +15,8 @@ from --format json step_finish events. Step_finish can be missing
 (upstream opencode #26855: CLI may exit on idle before emitting it);
 only a log whose LAST event is step_finish counts as complete, others
 are flagged with a reconcile warning and their sums treated as lower
-bounds (budget cap enforces against them conservatively). Stall
+bounds — so the --budget halt fires LATE (permissive) on incomplete
+rows: true spend may already exceed the cap. Stall
 watchdog kills runs whose log stops growing (stall_after_sec) and marks
 them stalled. Retry policy: timeouts/stalls and nonzero-exits with
 passing checks are retryable (--max-retries N re-dispatches
@@ -166,8 +167,13 @@ def parse_cost(log):
             'complete': complete, 'reason': reason}
 
 
-def ledger_append(ledger, tid, cost):
-    entry = {'task': tid, 'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S')}
+def ledger_append(ledger, tid, cost, attempt=1, outcome='unknown'):
+    # One row PER ATTEMPT (not per task): every dispatch costs money and
+    # collapsing retries would hide spend. Rows carry attempt + outcome so
+    # per-task totals stay auditable: sum rows by task, or take the row
+    # with the highest attempt for the final outcome.
+    entry = {'task': tid, 'attempt': attempt, 'outcome': outcome,
+             'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S')}
     entry.update(cost)
     if not cost.get('complete', True):
         entry['complete'] = False
@@ -315,14 +321,21 @@ def run_tasks(manifest, prompts, state, spath, only, model, timeout, dry,
                                    os.path.join(HERE, 'logs'),
                                    manifest.get('stall_after_sec', 600))
             cost = parse_cost(os.path.join(HERE, 'logs', t['id'] + '.log'))
-            ledger_append(os.path.join(HERE, 'ledger.jsonl'), t['id'], cost)
+            checks = [check_done(c, run_start) for c in t['done']]
+            done = (rc == 0 and all(checks))
+            # Ledger row is written for EVERY attempt (spend is real even
+            # when the attempt fails); the outcome field marks whether this
+            # attempt finished the task. Written before the retry decision
+            # so suppressed/retried attempts are all auditable.
+            ledger_append(os.path.join(HERE, 'ledger.jsonl'), t['id'], cost,
+                          attempt,
+                          'done' if done else 'attempt-failed')
             spent += cost.get('cost', 0.0)
             if not cost.get('complete', True):
                 print('%s: WARNING ledger incomplete (%s); totals are a '
                       'lower bound, reconcile via session DB/export' % (
                           t['id'], cost.get('reason')))
-            checks = [check_done(c, run_start) for c in t['done']]
-            if rc == 0 and all(checks):
+            if done:
                 outcome = ('done', {
                     'status': 'done',
                     'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
@@ -333,6 +346,16 @@ def run_tasks(manifest, prompts, state, spath, only, model, timeout, dry,
             retryable, label = failure_class(
                 rc, stalled or rc in (124, 125), checks)
             if retryable and attempt <= max_retries:
+                if budget is not None and spent >= budget:
+                    outcome = ('failed', {
+                        'status': 'failed', 'exit': rc, 'checks': checks,
+                        'run_start': run_start, 'attempt': attempt,
+                        'retryable': True,
+                        'reason': 'retry suppressed: spent %.4f >= cap %.4f '
+                                  '[%s]' % (spent, budget, label)})
+                    print('%s: RETRY SUPPRESSED (spent %.4f >= cap %.4f)' % (
+                        t['id'], spent, budget))
+                    break
                 print('%s: RETRY %d/%d (exit %s checks %s [%s])' % (
                     t['id'], attempt, max_retries, rc, checks, label))
                 continue

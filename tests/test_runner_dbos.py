@@ -8,7 +8,12 @@ import runner_dbos as m
 
 
 def test_import_without_dbos():
-    assert m._DBOS_AVAILABLE is False  # not installed in CI fixture
+    # Environment-dependent: if dbos IS installed here, there is nothing
+    # to assert about the missing-dependency path (require_dbos succeeds
+    # by design). Skip instead of failing on environment grounds.
+    if m._DBOS_AVAILABLE:
+        print('SKIP import-without-dbos (dbos installed in this env)')
+        return
     try:
         m.require_dbos()
     except RuntimeError as e:
@@ -55,18 +60,23 @@ def test_budget_sqlite_single_worker():
 
 
 def test_budget_settle_upsert():
-    # settle on a never-acquired scope must create the row, not no-op;
-    # semantics: spent = spent - estimate + actual.
+    # settle must create the row when absent (never a silent no-op) with
+    # ONE semantic on both backends: fresh row records exactly actual
+    # (PG fresh-row branch parity); acquire->settle nets to actual.
     os.environ['TASK_AUTO_SINGLE_WORKER'] = '1'
     try:
         d = tempfile.mkdtemp()
         s = m.BudgetStore('sqlite:///' + os.path.join(d, 'b.db'))
-        s.acquire('run:new', 1.0)   # tracked spend = 1.0
-        s.settle('run:new', 1.0, 0.4)  # reservation replaced by actual
+        s.settle('run:fresh', 1.0, 0.4)  # never acquired: fresh row
         cur = s.conn.cursor()
         cur.execute('SELECT spent_usd FROM taskauto_budget WHERE scope=?',
-                    ('run:new',))
+                    ('run:fresh',))
         assert abs(cur.fetchone()[0] - 0.4) < 1e-9
+        s.acquire('run:n', 1.0)
+        s.settle('run:n', 1.0, 0.25)
+        cur.execute('SELECT spent_usd FROM taskauto_budget WHERE scope=?',
+                    ('run:n',))
+        assert abs(cur.fetchone()[0] - 0.25) < 1e-9
     finally:
         del os.environ['TASK_AUTO_SINGLE_WORKER']
     print('PASS budget-settle-upsert')

@@ -117,9 +117,15 @@ def define_app(DBOS, mod):
         if rc == 0 and all(checks):
             final = {'status': 'done', 'checks': checks, 'cost': cost}
         else:
+            # Single-shot by design: this workflow never re-dispatches
+            # itself (durability = resume from last completed step, not an
+            # in-process retry loop like runner.py --max-retries). Transient
+            # failures surface as needs-operator-retry: re-launch the task
+            # workflow to retry; DBOS resumes from the last completed step.
             retryable, label = runner.failure_class(rc, rc in (124, 125),
                                                     checks)
-            final = {'status': 'failed' if not retryable else 'retryable',
+            final = {'status': ('needs-operator-retry' if retryable
+                                else 'failed'),
                      'exit': rc, 'checks': checks, 'label': label}
             step_notify_runbook(task['id'], 'non-done: %s' % (final,))
         if opts.get('needs_approval') and final.get('status') == 'done':
