@@ -118,6 +118,30 @@ def test_failure_class_zero_exit():
     print('PASS failure-class-zero')
 
 
+def test_pg_settle_statement_shape():
+    # No live Postgres here: pin the SQL contract with a fake cursor.
+    # Fresh row must store ACTUAL (params[1]); conflict branch must
+    # compute spent - estimate + actual (params[2], params[3]).
+    seen = {}
+
+    class FakeCur:
+        def execute(self, sql, params):
+            seen['sql'] = sql
+            seen['params'] = params
+
+    store = m.BudgetStore.__new__(m.BudgetStore)
+    store.is_pg = True
+    store.conn = type('C', (), {'cursor': lambda self: FakeCur(),
+                                'commit': lambda self: None})()
+    store.settle('run:x', 1.0, 0.4)
+    sql, p = seen['sql'], seen['params']
+    assert 'ON CONFLICT (scope) DO UPDATE' in sql, sql
+    assert p[0] == 'run:x' and p[1] == 0.4, p  # fresh row stores actual
+    assert p[2] == 1.0 and p[3] == 0.4, p  # update: spent-est+actual
+    assert 'EXCLUDED.spent_usd' not in sql, sql  # would be actual, wrong
+    print('PASS pg-settle-shape')
+
+
 if __name__ == '__main__':
     test_import_without_dbos()
     test_workflow_id()
@@ -127,4 +151,5 @@ if __name__ == '__main__':
     test_budget_sqlite_path_resolution()
     test_budget_sqlite_refused_multiworker()
     test_failure_class_zero_exit()
+    test_pg_settle_statement_shape()
     print('ALL PASS')

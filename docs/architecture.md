@@ -25,8 +25,9 @@ Single-threaded, sequential dispatcher:
    watches log growth (`stall_after_sec`) and a hard deadline
    (`--timeout` / `task_timeout_sec`), kills on stall/timeout with
    distinct exit codes (125 stalled, 124 timeout, 127 missing binary).
-4. After each attempt: parse cost, append ledger row, run done-checks,
-   classify (`failure_class`), retry or record the outcome, save state.
+4. After each attempt: parse cost, run done-checks, append the ledger row
+   (with that attempt's outcome), classify (`failure_class`), retry or
+   record the outcome, save state.
 
 ## State machine
 

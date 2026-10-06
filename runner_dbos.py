@@ -167,22 +167,20 @@ class BudgetStore:
 
     def settle(self, scope, estimate, actual):
         """Replace the outstanding estimate with actual. Upserts: never a
-        silent no-op on unknown scopes. Both backends share one semantic:
-        spent = COALESCE(existing, estimate) - estimate + actual, so a
-        fresh row records exactly actual on PG and SQLite alike. Must run
-        inside a step."""
+        silent no-op on unknown scopes. One semantic on both backends: a
+        fresh row records exactly actual; an existing row computes
+        spent - estimate + actual. Must run inside a step."""
         cur = self.conn.cursor()
         if self.is_pg:
-            # Proposed row carries the estimate; the call carries actual.
-            # Fresh row: existing spend is implicitly the estimate, so the
-            # result is exactly actual. Existing row: spend-estimate+actual.
-            # One statement, no read-modify-write race under FOR UPDATE
-            # callers (acquire holds the lock; settle runs in its own step).
+            # Fresh row (no conflict): VALUES stores actual directly.
+            # Existing row: spent - estimate + actual, with estimate as an
+            # explicit parameter (EXCLUDED would hold the proposed actual,
+            # not the estimate). One statement, no read-modify-write race.
             cur.execute('INSERT INTO taskauto_budget(scope, cap_usd, '
                         'spent_usd) VALUES (%s, NULL, %s) '
                         'ON CONFLICT (scope) DO UPDATE SET spent_usd='
-                        'taskauto_budget.spent_usd-EXCLUDED.spent_usd+%s',
-                        (scope, estimate, actual))
+                        'taskauto_budget.spent_usd-%s+%s',
+                        (scope, actual, estimate, actual))
         else:
             cur.execute('BEGIN IMMEDIATE')
             cur.execute('SELECT spent_usd FROM taskauto_budget '

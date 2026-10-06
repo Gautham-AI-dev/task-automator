@@ -61,10 +61,15 @@ def define_app(DBOS, mod):
         return [runner.check_done(c, run_start) for c in task['done']]
 
     @DBOS.step(retries_allowed=False)
-    def step_ledger(task_id, log):
+    def step_ledger(task_id, log, rc, checks):
+        # Outcome is decided by the caller (exit + checks), same rule as
+        # the core runner: only exit-0-with-all-checks is done. No
+        # 'unknown' rows: every ledger row carries a documented outcome.
         cost = runner.parse_cost(log)
+        outcome = 'done' if (rc == 0 and all(checks)) else 'attempt-failed'
         runner.ledger_append(
-            os.path.join(runner.HERE, 'ledger.jsonl'), task_id, cost)
+            os.path.join(runner.HERE, 'ledger.jsonl'), task_id, cost,
+            attempt=1, outcome=outcome)
         return cost
 
     @DBOS.step(retries_allowed=False)
@@ -111,7 +116,8 @@ def define_app(DBOS, mod):
         checks = step_verify(task, run_start)
         cost = step_ledger(task['id'],
                            os.path.join(runner.HERE, 'logs',
-                                        task['id'] + '.log'))
+                                        task['id'] + '.log'),
+                           rc, checks)
         step_settle(opts['budget_url'], scopes, estimate,
                     float(cost.get('cost', 0.0)))
         if rc == 0 and all(checks):

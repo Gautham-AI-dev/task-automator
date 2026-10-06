@@ -3,8 +3,9 @@
 ## Which AI models work?
 
 Any model `opencode run -m` accepts (`--model` overrides the manifest
-default). Verified with a free-tier route at $0 cost; paid models work
-identically — the ledger just records real spend.
+default). Free-tier routes work (ledger records zero cost); paid models
+work identically — the ledger records real spend. No specific cost figure
+is claimed here: verify against your own ledger rows.
 
 ## Which OS?
 

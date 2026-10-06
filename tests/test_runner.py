@@ -172,11 +172,28 @@ def test_ledger_per_attempt_rows():
             open(os.path.join(d, 'ledger.jsonl')) if ln.strip()]
     assert len(rows) == 2, rows
     assert [r['attempt'] for r in rows] == [1, 2], rows
-    assert rows[-1]['outcome'] == 'done' or \
-        rows[-1]['outcome'] == 'attempt-failed', rows
+    # deterministic: rc=1 both attempts, retries exhausted after attempt 2
+    # (max_retries=1), so BOTH rows are attempt-failed — pinned, not or-ed.
+    assert [r['outcome'] for r in rows] == ['attempt-failed',
+                                           'attempt-failed'], rows
     assert abs(runner.ledger_total(os.path.join(d, 'ledger.jsonl'))
                - 1.0) < 1e-9
     print('PASS ledger-per-attempt')
+
+
+def test_ledger_rejects_unknown_outcome():
+    # schema guard: 'unknown' (or anything outside the enum) fails loud at
+    # the call site instead of writing a bad row.
+    import tempfile
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, 'ledger.jsonl')
+    try:
+        runner.ledger_append(p, 'T1', {'cost': 0.0}, 1, 'unknown')
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('unknown outcome must raise')
+    print('PASS ledger-enum-guard')
 
 
 def test_retry_suppressed_over_budget():
@@ -323,5 +340,6 @@ if __name__ == '__main__':
     test_legacy_done_reruns()
     test_retry_loop()
     test_ledger_per_attempt_rows()
+    test_ledger_rejects_unknown_outcome()
     test_retry_suppressed_over_budget()
     print('ALL PASS')

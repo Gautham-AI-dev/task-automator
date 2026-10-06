@@ -10,8 +10,9 @@ any break (intended or crash). Usage:
 Done-check types: newfile (glob newer than run start), minlines,
 mtime (file newer than run start). Time gate: T12-style telemetry
 span/entries. State writes are crash-safe (tmp + os.replace).
-Cost ledger: ledger.jsonl accumulates per-task tokens/cost parsed
-from --format json step_finish events. Step_finish can be missing
+Cost ledger: ledger.jsonl accumulates per-attempt rows (task, attempt,
+outcome, tokens, cost) parsed from --format json step_finish events.
+Step_finish can be missing
 (upstream opencode #26855: CLI may exit on idle before emitting it);
 only a log whose LAST event is step_finish counts as complete, others
 are flagged with a reconcile warning and their sums treated as lower
@@ -167,11 +168,15 @@ def parse_cost(log):
             'complete': complete, 'reason': reason}
 
 
-def ledger_append(ledger, tid, cost, attempt=1, outcome='unknown'):
+def ledger_append(ledger, tid, cost, attempt, outcome):
     # One row PER ATTEMPT (not per task): every dispatch costs money and
-    # collapsing retries would hide spend. Rows carry attempt + outcome so
-    # per-task totals stay auditable: sum rows by task, or take the row
-    # with the highest attempt for the final outcome.
+    # collapsing retries would hide spend. attempt + outcome are REQUIRED
+    # (no defaults): 'unknown' outcomes are a schema violation, fail loud
+    # at the call site instead of writing bad rows. outcome is 'done' or
+    # 'attempt-failed' — see docs/budget.md.
+    if outcome not in ('done', 'attempt-failed'):
+        raise ValueError("ledger outcome must be 'done'/'attempt-failed', "
+                         'got %r' % (outcome,))
     entry = {'task': tid, 'attempt': attempt, 'outcome': outcome,
              'finished_at': time.strftime('%Y-%m-%dT%H:%M:%S')}
     entry.update(cost)
