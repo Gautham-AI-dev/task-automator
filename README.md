@@ -8,6 +8,13 @@ stall watchdog. MIT licensed (see LICENSE).
 
 - `SKILL.md` — contract, neighbor map, resume guarantee.
 - `runner.py` — the runner (stdlib only).
+- `runner_dbos.py` + `runner_dbos_workflow.py` — OPTIONAL Phase 2:
+  durable per-task workflows on DBOS + Postgres (needs
+  `pip install "dbos[postgres]>=2.0"` + `DATABASE_URL`; plain `runner.py`
+  needs nothing). See SKILL.md.
+- `tests/test_runner.py` — offline tests (`python tests/test_runner.py`).
+- `tests/test_runner_dbos.py` — offline tests for the DBOS module
+  (`python tests/test_runner_dbos.py`; needs no DBOS/Postgres).
 - `tests/test_runner.py` — offline tests (`python tests/test_runner.py`).
 - `tasks.example.json` — 3-task example manifest (edit paths, rename to
   `tasks.json`).

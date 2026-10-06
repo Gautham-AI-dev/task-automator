@@ -81,6 +81,29 @@ treat their totals as authoritative; reconcile via the session DB/export.
 
 1. Every state mutation is crash-safe (write tmp + os.replace).
 2. Done is re-verified, never trusted: done-checks run against the
-   filesystem on every invocation before skipping.
+   filesystem on every invocation before skipping; a task whose
+   artifacts vanished is RE-RUN, not skipped.
 3. Failed/stalled tasks keep their logs; resume retries them in place.
 4. Dry-run never writes state, never dispatches, never fails a task.
+
+## Phase 2 (optional): durable per-task workflows (`runner_dbos.py`)
+
+For multi-day runs / human approval gates, one DBOS workflow per task
+(never one-workflow-per-catalog: keeps histories short, no 30-min
+workflow sleeps). Requires `pip install "dbos[postgres]>=2.0"` and
+`DATABASE_URL` at Postgres; without them the module imports fine but
+`launch/status/approve` raise a clear error. Plain `runner.py` stays
+zero-dependency and is the default.
+
+```
+python runner_dbos.py launch --only T01 [--model ...] [--estimate 1.0] [--needs-approval]
+python runner_dbos.py status --wid taskauto-T01-<stamp>
+python runner_dbos.py approve --wid taskauto-T01-<stamp> --approve yes|no
+```
+
+Rules baked in (report-code bugs fixed): every budget/ledger/side effect
+is a `@step` (workflow body orchestrates only); dispatch is an async
+step so `timeout_seconds` applies; ledger append is non-retried; budget
+caps live in Postgres with `SELECT ... FOR UPDATE` (SQLite only with
+`TASK_AUTO_SINGLE_WORKER=1`, otherwise refused); approval waits are
+durable `recv` with timeout, fail-closed on timeout/unclear messages.
