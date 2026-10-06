@@ -1,7 +1,15 @@
 # FAQ
 
-## Which AI models work?
+## Which agents can tasks use?
 
+The `agent` field in `tasks.json` names an agent registered in your
+opencode configuration (user `~/.config/opencode/` or project
+`.opencode/`). The examples use `"agent": "build"` — replace it with an
+agent that exists in YOUR registry, or dispatch fails with exit 127 /
+agent-not-found. List yours with `opencode agent list` (or inspect your
+opencode config) before editing `tasks.json`.
+
+## Which AI models work?
 Any model `opencode run -m` accepts (`--model` overrides the manifest
 default). Free-tier routes work (ledger records zero cost); paid models
 work identically — the ledger records real spend. No specific cost figure
