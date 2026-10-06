@@ -355,8 +355,13 @@ def run_tasks(manifest, prompts, state, spath, only, model, timeout, dry,
             # when the attempt fails); the outcome field marks whether this
             # attempt finished the task. Written before the retry decision
             # so suppressed/retried attempts are all auditable.
+            # Ledger attempt numbers are MONOTONIC per task across all runs
+            # (prior + attempt): the ledger is append-only, so reusing
+            # fresh-sequence numbers after a RE-RUN would create duplicate
+            # attempt rows and break highest-attempt-wins ordering. State
+            # attempt stays per-run-sequence (retry-allowance semantic).
             ledger_append(os.path.join(HERE, 'ledger.jsonl'), t['id'], cost,
-                          attempt,
+                          prior + attempt,
                           'done' if done else 'attempt-failed')
             spent += cost.get('cost', 0.0)
             if not cost.get('complete', True):

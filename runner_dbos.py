@@ -297,9 +297,11 @@ def main(argv=None):
     ap.add_argument('--wid', default='')
     ap.add_argument('--estimate', type=float, default=1.0)
     ap.add_argument('--attempt', type=int, default=1,
-                    help='attempt number for this launch: re-launches after '
-                         'needs-operator-retry pass the next number so '
-                         'ledger rows keep attempt ordering')
+                    help='ledger attempt number for this launch. Ledger '
+                         'attempts are monotonic per task: re-launches after '
+                         'needs-operator-retry must pass max-prior-attempt+1 '
+                         '(read it from ledger.jsonl), or rows collide and '
+                         'highest-attempt-wins ordering breaks')
     ap.add_argument('--needs-approval', action='store_true')
     a = ap.parse_args(argv)
     if a.cmd == 'launch':

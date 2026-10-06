@@ -85,6 +85,8 @@ def define_app(DBOS, mod):
         with mod.BudgetStore(budget_url) as store:
             for s in scopes:
                 store.settle(s, estimate, 0.0)
+
+    @DBOS.step(retries_allowed=True, max_attempts=3)
     def step_notify_runbook(task_id, reason):
         # delivery to pager/runbook goes here; retryable by design.
         # STUB (unexecuted): wire to the real runbook channel before

@@ -53,7 +53,8 @@ Entry for skill-collection READMEs (e.g. open-hax/opencode-skills style):
 - [ ] PR title: `Add task-automator` (or the list's convention).
 - [ ] PR body: one sentence on what it is + note the test suite and docs
       (curators check maintenance signals: recent commits, issues enabled,
-      license file present — all true for this repo).
+      LICENSE file present — all true for this repo: see `LICENSE`
+      (MIT, 2026 Gautham-AI-dev) at repo root).
 - [ ] If rejected, ask what would change their mind; common asks are usage
       examples (point at `tasks.example.json` + `docs/faq.md`) and a demo
       (offer the dry-run transcript).

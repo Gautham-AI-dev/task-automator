@@ -252,6 +252,12 @@ def test_rerun_resets_attempts():
         rec = runner.load_state(spath)['tasks']['T01']
         assert rec['attempt'] == 1, rec  # fresh sequence, not 4
         assert rec.get('prior_attempts') == 3, rec  # history kept
+    # ledger row uses the MONOTONIC number (prior 3 + attempt 1 = 4):
+    # no duplicate attempt-1 row, highest-attempt-wins ordering holds.
+    import json
+    rows = [json.loads(ln) for ln in
+            open(os.path.join(d, 'ledger.jsonl')) if ln.strip()]
+    assert [r['attempt'] for r in rows] == [4], rows
     print('PASS rerun-attempts')
 
 

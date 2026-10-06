@@ -76,7 +76,11 @@ Parsed from `--format json` step_finish events: input/output tokens and
 cost. Every dispatch writes a row — including failed and retried attempts,
 since every attempt costs money. Rows carry `task`, `attempt`, `outcome`
 (`done` | `attempt-failed`) and `finished_at`: sum rows by task for total
-spend, or take the highest-attempt row for the final outcome. Feeds
+spend, or take the highest-attempt row for the final outcome. Ledger
+attempt numbers are monotonic per task across ALL runs (a RE-RUN after
+vanished artifacts offsets by `prior_attempts`); state `attempt` is
+per-run-sequence for retry accounting — the two numberings differ by
+design, bridged by `prior_attempts`. Feeds
 cost-guard budgeting. Stuck detection: the watchdog kills runs
 whose log stops growing for `stall_after_sec` and marks them `stalled`.
 
